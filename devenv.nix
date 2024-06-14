@@ -13,7 +13,8 @@ in
     packages = with pkgs; [
       git
       mysql-client
-      nginx 
+      nginx
+      gh
     ];
 
     certificates = [
