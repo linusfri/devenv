@@ -43,6 +43,10 @@ in
       '';
     };
 
+    services.mysql = {
+
+    };
+
     languages = {
       javascript = {
         enable = true;
