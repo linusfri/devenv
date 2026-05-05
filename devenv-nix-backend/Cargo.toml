@@ -6,7 +6,6 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-blake3.workspace = true
 serde_json.workspace = true
 async-trait.workspace = true
 cstr.workspace = true
@@ -15,10 +14,8 @@ serde.workspace = true
 ser_nix.workspace = true
 include_dir.workspace = true
 tracing.workspace = true
-secretspec.workspace = true
 once_cell.workspace = true
 tokio.workspace = true
-tokio-shutdown.workspace = true
 uuid.workspace = true
 
 devenv-core.workspace = true
@@ -35,9 +32,15 @@ nix-bindings-util.workspace = true
 nix-bindings-fetchers.workspace = true
 nix-bindings-bindgen-raw.workspace = true
 nix-cmd.workspace = true
+nix.workspace = true
 tempfile.workspace = true
 
 [dev-dependencies]
 devenv-nix-backend-macros.workspace = true
 tempfile.workspace = true
 tokio.workspace = true
+
+[features]
+default = []
+test-all = ["test-nix-store"]
+test-nix-store = []

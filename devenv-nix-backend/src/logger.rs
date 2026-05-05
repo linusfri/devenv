@@ -188,7 +188,10 @@ fn create_log_callback(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nix_bindings_expr::eval_state::{EvalStateBuilder, gc_register_my_thread};
+    #[cfg(feature = "test-nix-store")]
+    use nix_bindings_expr::eval_state::EvalStateBuilder;
+    use nix_bindings_expr::eval_state::gc_register_my_thread;
+    #[cfg(feature = "test-nix-store")]
     use nix_bindings_store::store::Store;
 
     #[test]
@@ -205,6 +208,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "test-nix-store")]
     fn test_logger_captures_activity() {
         // Initialize Nix
         nix_bindings_expr::eval_state::init().expect("Failed to initialize Nix");

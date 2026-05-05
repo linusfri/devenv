@@ -20,7 +20,7 @@ enum Command {
         #[clap()]
         roots: Vec<String>,
 
-        #[clap(long, value_enum, default_value_t = RunMode::Single, help = "The execution mode for tasks (affects dependency resolution)")]
+        #[clap(long, value_enum, default_value_t = RunMode::Before, help = "The execution mode for tasks (affects dependency resolution)")]
         mode: RunMode,
 
         #[clap(
@@ -36,10 +36,12 @@ enum Command {
 
         #[clap(long, help = "Runtime directory for process state")]
         runtime_dir: PathBuf,
-    },
-    Export {
-        #[clap()]
-        strings: Vec<String>,
+
+        #[clap(
+            long,
+            help = "Exclude non-root process tasks from the scheduled subgraph (used when process-compose manages process ordering)"
+        )]
+        ignore_process_deps: bool,
     },
 }
 
@@ -99,10 +101,7 @@ async fn main() -> Result<()> {
     let shutdown = Shutdown::new();
     shutdown.install_signals().await;
 
-    tokio::select! {
-        result = run_tasks(shutdown.clone()) => result?,
-        _ = shutdown.wait_for_shutdown() => {}
-    };
+    run_tasks(shutdown.clone()).await?;
 
     Ok(())
 }
@@ -154,6 +153,7 @@ async fn run_tasks(shutdown: Arc<Shutdown>) -> Result<()> {
             task_file,
             cache_dir,
             runtime_dir,
+            ignore_process_deps,
         } => {
             let mut tasks: Vec<TaskConfig> = fetch_tasks(&task_file)?;
 
@@ -179,6 +179,8 @@ async fn run_tasks(shutdown: Arc<Shutdown>) -> Result<()> {
                 cache_dir,
                 sudo_context: sudo_context.clone(),
                 env: std::env::vars().collect(),
+                bash: String::new(),
+                ignore_process_deps,
             };
 
             let tasks = Tasks::builder(config, verbosity, Arc::clone(&shutdown))
@@ -187,7 +189,7 @@ async fn run_tasks(shutdown: Arc<Shutdown>) -> Result<()> {
 
             // Initialize activity channel for TasksUi
             let (activity_rx, activity_handle) = devenv_activity::init();
-            activity_handle.install();
+            let _activity_guard = activity_handle.install();
 
             let tasks = Arc::new(tasks);
             let tasks_clone = Arc::clone(&tasks);
@@ -197,46 +199,16 @@ async fn run_tasks(shutdown: Arc<Shutdown>) -> Result<()> {
 
             // Run UI - processes events and waits for run_handle
             let ui = TasksUi::new(Arc::clone(&tasks), activity_rx, verbosity);
-            let (status, _) = ui.run(run_handle).await?;
+            let (status, _) = ui.run(run_handle, false).await?;
 
             if shutdown.last_signal().is_some() {
+                let _ = tasks.process_manager().stop_all().await;
                 shutdown.exit_process();
             }
 
             if status.has_failures() {
                 std::process::exit(1);
             }
-        }
-        Command::Export { strings } => {
-            let output_file =
-                env::var("DEVENV_TASK_OUTPUT_FILE").expect("DEVENV_TASK_OUTPUT_FILE not set");
-            let mut output: serde_json::Value = std::fs::read_to_string(&output_file)
-                .map(|content| serde_json::from_str(&content).unwrap_or(serde_json::json!({})))
-                .unwrap_or(serde_json::json!({}));
-
-            let mut exported_vars = serde_json::Map::new();
-            for var in strings {
-                if let Ok(value) = env::var(&var) {
-                    exported_vars.insert(var, serde_json::Value::String(value));
-                }
-            }
-
-            if !output.as_object().unwrap().contains_key("devenv") {
-                output["devenv"] = serde_json::json!({});
-            }
-            if !output["devenv"].as_object().unwrap().contains_key("env") {
-                output["devenv"]["env"] = serde_json::json!({});
-            }
-            output["devenv"]["env"] = serde_json::Value::Object(
-                output["devenv"]["env"]
-                    .as_object()
-                    .cloned()
-                    .unwrap_or_default()
-                    .into_iter()
-                    .chain(exported_vars)
-                    .collect(),
-            );
-            std::fs::write(output_file, serde_json::to_string_pretty(&output)?)?;
         }
     }
 
@@ -263,7 +235,9 @@ fn fetch_tasks(task_file: &Option<PathBuf>) -> Result<Vec<TaskConfig>> {
 ///
 /// Returns the raw JSON string and the source it came from, or an error if no source is available.
 fn read_raw_task_source(task_file: &Option<PathBuf>) -> Result<(String, TaskSource)> {
-    if let Ok(raw) = env::var("DEVENV_TASKS") {
+    if let Ok(raw) = env::var("DEVENV_TASKS")
+        && !raw.is_empty()
+    {
         return Ok((raw, TaskSource::EnvVar));
     }
 

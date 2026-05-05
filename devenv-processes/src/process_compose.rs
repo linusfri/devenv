@@ -6,6 +6,7 @@ use async_trait::async_trait;
 use miette::{IntoDiagnostic, Result, bail};
 use nix::sys::signal::{self, Signal};
 use nix::unistd::Pid;
+use std::collections::HashMap;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -50,6 +51,38 @@ impl ProcessComposeManager {
     /// Path to the wrapper script
     fn wrapper_script(&self) -> PathBuf {
         self.state_dir.join("processes")
+    }
+
+    /// Prepare the foreground command without exec'ing.
+    ///
+    /// Returns a `std::process::Command` ready to be exec'd by the caller
+    /// after terminal cleanup.
+    pub async fn prepare_foreground_command(
+        &self,
+        processes: &[String],
+        env: &HashMap<String, String>,
+    ) -> Result<std::process::Command> {
+        match pid::check_pid_file(&self.pid_file()).await? {
+            PidStatus::Running(pid) => {
+                bail!(
+                    "Processes already running with PID {}. Stop them first with: devenv processes down",
+                    pid
+                );
+            }
+            PidStatus::NotFound | PidStatus::StaleRemoved => {}
+        }
+
+        self.write_wrapper_script(processes, false).await?;
+
+        let wrapper = self.wrapper_script();
+        let mut cmd = std::process::Command::new("bash");
+        cmd.arg(&wrapper);
+
+        if !env.is_empty() {
+            cmd.env_clear().envs(env);
+        }
+
+        Ok(cmd)
     }
 
     /// Write the wrapper script that invokes process-compose
@@ -104,6 +137,21 @@ impl ProcessManager for ProcessComposeManager {
         }
 
         if options.detach {
+            // Make the child its own process group leader so that stop()
+            // can signal the entire group with kill(-pid, SIGTERM).
+            // SAFETY: pre_exec runs in a forked child process before exec.
+            // setpgid is async-signal-safe and does not allocate or access shared state.
+            unsafe {
+                cmd.pre_exec(|| {
+                    nix::unistd::setpgid(
+                        nix::unistd::Pid::from_raw(0),
+                        nix::unistd::Pid::from_raw(0),
+                    )
+                    .map_err(std::io::Error::other)?;
+                    Ok(())
+                });
+            }
+
             // Detached mode: spawn and save PID
             let process = if options.log_to_file {
                 let log_file = std::fs::File::create(self.log_file()).into_diagnostic()?;
@@ -129,10 +177,7 @@ impl ProcessManager for ProcessComposeManager {
             }
             info!("Stop:      $ devenv processes stop");
         } else {
-            // Foreground mode: exec into the process
-            use std::os::unix::process::CommandExt;
-            let err = cmd.into_std().exec();
-            bail!("Failed to exec process-compose: {}", err);
+            bail!("foreground mode should use prepare_foreground_command() instead");
         }
 
         Ok(())
@@ -148,16 +193,31 @@ impl ProcessManager for ProcessComposeManager {
         let pid = pid::read_pid(&pid_file).await?;
         info!("Stopping process with PID {}", pid);
 
-        // Send SIGTERM
-        match signal::kill(pid, Signal::SIGTERM) {
+        // Send SIGTERM to the process group so child processes also receive
+        // the signal. If the process is a group leader (which it will be when
+        // spawned in detached mode), this reaches all its descendants.
+        let pgid = Pid::from_raw(-pid.as_raw());
+        match signal::kill(pgid, Signal::SIGTERM) {
             Ok(_) => {}
             Err(nix::errno::Errno::ESRCH) => {
-                warn!("Process with PID {} not found, cleaning up PID file", pid);
-                pid::remove_pid(&pid_file).await?;
-                return Ok(());
+                warn!(
+                    "Process group for PID {} not found, trying PID directly",
+                    pid
+                );
+                match signal::kill(pid, Signal::SIGTERM) {
+                    Ok(_) => {}
+                    Err(nix::errno::Errno::ESRCH) => {
+                        warn!("Process with PID {} not found, cleaning up PID file", pid);
+                        pid::remove_pid(&pid_file).await?;
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        bail!("Failed to send SIGTERM to PID {}: {}", pid, e);
+                    }
+                }
             }
             Err(e) => {
-                bail!("Failed to send SIGTERM to PID {}: {}", pid, e);
+                bail!("Failed to send SIGTERM to process group {}: {}", pid, e);
             }
         }
 

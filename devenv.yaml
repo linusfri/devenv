@@ -5,10 +5,10 @@ inputs:
 
   # Use the local development modules
   devenv:
-    url: path:.?dir=src/modules
+    url: .?dir=src/modules
 
   nix:
-    url: github:cachix/nix/devenv-2.32
+    url: github:cachix/nix/devenv-2.34
 
   git-hooks:
     url: github:cachix/git-hooks.nix
@@ -24,6 +24,15 @@ inputs:
     inputs:
       nixpkgs:
         follows: nixpkgs
+
+  crate2nix:
+    # https://github.com/nix-community/crate2nix/issues/439
+    url: github:rossng/crate2nix/ba5dd398e31ee422fbe021767eb83b0650303a6e
+
+  ghostty:
+    # Provides libghostty-vt.
+    # Kept in sync with flake.nix's ghostty input.
+    url: github:ghostty-org/ghostty
 
   devenv-claude-agents:
     url: github:cachix/devenv-claude-agents

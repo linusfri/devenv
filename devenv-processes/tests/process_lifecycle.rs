@@ -210,12 +210,21 @@ async fn test_stop_terminates_process() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_force_kill_after_timeout() {
     timeout(Duration::from_secs(20), async {
-        // Script that ignores SIGTERM
-        let script = r#"trap '' TERM; sleep 3600"#;
-        let job = run_shell_command(script).await;
+        let ctx = TestContext::new();
+        let ready_file = ctx.temp_path().join("ready.txt");
 
-        // Give trap time to set up
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        // Script that installs a SIGTERM-ignore trap, signals ready, then sleeps forever
+        let script = format!(
+            r#"trap '' TERM; echo ready > {}; sleep 3600"#,
+            ready_file.display()
+        );
+        let job = run_shell_command(&script).await;
+
+        // Wait for the trap to be installed (signaled by the ready file)
+        assert!(
+            wait_for_file(&ready_file, Duration::from_secs(5)).await,
+            "Script should signal ready after installing trap"
+        );
 
         // Stop with a short grace period
         let stop_start = std::time::Instant::now();
@@ -239,6 +248,67 @@ async fn test_force_kill_after_timeout() {
     .expect("Test timed out");
 }
 
+/// Test that manager.stop() waits for TERM trap cleanup before returning.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_manager_stop_waits_for_term_cleanup() {
+    timeout(Duration::from_secs(15), async {
+        let ctx = TestContext::new();
+        let ready_file = ctx.temp_path().join("ready.txt");
+        let cleanup_file = ctx.temp_path().join("cleanup.txt");
+
+        let script = ctx
+            .create_script(
+                "term-cleanup.sh",
+                r#"#!/bin/sh
+cleanup_file="$1"
+ready_file="$2"
+
+trap 'sleep 0.2; echo stopped > "$cleanup_file"; exit 0' TERM
+
+echo ready > "$ready_file"
+while true; do
+  sleep 1
+done
+"#,
+            )
+            .await;
+
+        let manager = ctx.create_manager();
+        let config = ProcessConfig {
+            name: "term-cleanup".to_string(),
+            exec: format!(
+                "{} {} {}",
+                script.display(),
+                cleanup_file.display(),
+                ready_file.display()
+            ),
+            args: vec![],
+            ..Default::default()
+        };
+
+        manager
+            .start_command(&config, None)
+            .await
+            .expect("Failed to start");
+
+        assert!(
+            wait_for_file(&ready_file, Duration::from_secs(5)).await,
+            "Script should signal ready"
+        );
+
+        manager.stop("term-cleanup").await.expect("Failed to stop");
+
+        assert!(
+            cleanup_file.exists(),
+            "TERM cleanup should finish before stop() returns"
+        );
+        let cleanup = tokio::fs::read_to_string(&cleanup_file).await.unwrap();
+        assert!(cleanup.contains("stopped"));
+    })
+    .await
+    .expect("Test timed out");
+}
+
 /// Test that is_running returns false initially
 #[tokio::test(flavor = "multi_thread")]
 async fn test_is_running_initially_false() {
@@ -247,6 +317,109 @@ async fn test_is_running_initially_false() {
 
     // Manager has no PID file initially
     assert!(!manager.is_running().await);
+}
+
+/// Test that a process reading stdin gets EOF immediately and exits cleanly
+#[tokio::test(flavor = "multi_thread")]
+async fn test_stdin_closed_for_processes() {
+    timeout(TEST_TIMEOUT, async {
+        let ctx = TestContext::new();
+        let manager = ctx.create_manager();
+
+        // Script reads from stdin, then writes what it got. With stdin closed
+        // (/dev/null), `read` returns immediately with empty input.
+        let config = ProcessConfig {
+            name: "stdin-reader".to_string(),
+            exec: "bash -c 'read line; echo \"got: [$line]\"'".to_string(),
+            ..Default::default()
+        };
+
+        manager
+            .start_command(&config, None)
+            .await
+            .expect("Failed to start");
+
+        // The process should complete and write output since stdin is /dev/null.
+        // `read` gets EOF immediately so the script finishes without hanging.
+        let stdout_log = ctx.state_dir.join("logs/stdin-reader.stdout.log");
+        assert!(
+            wait_for_file_content(&stdout_log, "got: []", STARTUP_TIMEOUT).await,
+            "Process should have received empty stdin and written output"
+        );
+
+        manager.stop_all().await.expect("Failed to stop all");
+    })
+    .await
+    .expect("Test timed out");
+}
+
+/// Test that stopping a process also kills its child processes.
+///
+/// Simulates a service (like postgres) that spawns a child worker. When the
+/// parent is stopped, the child must also be terminated.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_stop_kills_child_processes() {
+    timeout(Duration::from_secs(15), async {
+        let ctx = TestContext::new();
+        let child_pid_file = ctx.temp_path().join("child.pid");
+        let ready_file = ctx.temp_path().join("ready.txt");
+
+        let config = ProcessConfig {
+            name: "parent-with-child".to_string(),
+            // Spawn a background child process and write its PID to a file
+            exec: format!(
+                r#"bash -c 'sleep 3600 &
+echo $! > {}
+echo ready > {}
+wait'"#,
+                child_pid_file.display(),
+                ready_file.display()
+            ),
+            ..Default::default()
+        };
+
+        let manager = ctx.create_manager();
+        manager
+            .start_command(&config, None)
+            .await
+            .expect("Failed to start");
+
+        assert!(
+            wait_for_file(&ready_file, STARTUP_TIMEOUT).await,
+            "Process should signal ready"
+        );
+
+        // Read the child PID
+        let child_pid_str = tokio::fs::read_to_string(&child_pid_file)
+            .await
+            .expect("Failed to read child PID");
+        let child_pid: i32 = child_pid_str.trim().parse().expect("Invalid child PID");
+
+        // Verify child is running
+        assert_eq!(
+            unsafe { nix::libc::kill(child_pid, 0) },
+            0,
+            "Child process should be running before stop"
+        );
+
+        // Stop the parent
+        manager
+            .stop("parent-with-child")
+            .await
+            .expect("Failed to stop");
+
+        // Wait briefly for signals to propagate
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // Verify child is also gone
+        assert_ne!(
+            unsafe { nix::libc::kill(child_pid, 0) },
+            0,
+            "Child process should be killed after parent is stopped"
+        );
+    })
+    .await
+    .expect("Test timed out");
 }
 
 /// Test process that writes stdout/stderr via shell command

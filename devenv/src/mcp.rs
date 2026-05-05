@@ -1,13 +1,13 @@
 #![allow(dead_code)]
 
 use crate::devenv::{Devenv, DevenvOptions};
-use devenv_activity::Activity;
-use devenv_core::{Config, Options};
-use miette::Result;
+use devenv_activity::{Activity, activity};
+use devenv_core::BuildOptions;
+use miette::{Result, miette};
 use rmcp::handler::server::tool::{ToolCallContext, ToolRouter};
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
-    CallToolRequestParam, CallToolResult, ListToolsResult, PaginatedRequestParam,
+    CallToolRequestParams, CallToolResult, ListToolsResult, PaginatedRequestParams,
     ServerCapabilities, ServerInfo,
 };
 use rmcp::service::RequestContext;
@@ -17,17 +17,17 @@ use rmcp::{ErrorData as McpError, RoleServer, ServerHandler, ServiceExt, tool, t
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
-use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{info, warn};
 
 #[derive(Clone)]
 struct DevenvMcpServer {
-    config: Config,
+    options: DevenvOptions,
     cache: Arc<RwLock<McpCache>>,
-    devenv_root: Option<PathBuf>,
     tool_router: ToolRouter<Self>,
+    /// Path to the native process manager API socket, if available.
+    process_socket_path: Option<std::path::PathBuf>,
 }
 
 #[derive(Default)]
@@ -37,36 +37,75 @@ struct McpCache {
 }
 
 impl DevenvMcpServer {
-    fn new(config: Config) -> Self {
-        Self::new_with_root(config, None)
+    fn new(options: DevenvOptions) -> Self {
+        let process_socket_path = Self::compute_socket_path(&options);
+        Self {
+            options,
+            cache: Arc::new(RwLock::new(McpCache::default())),
+            tool_router: Self::tool_router(),
+            process_socket_path,
+        }
     }
 
-    fn new_with_root(config: Config, devenv_root: Option<PathBuf>) -> Self {
-        Self {
-            config,
-            cache: Arc::new(RwLock::new(McpCache::default())),
-            devenv_root,
-            tool_router: Self::tool_router(),
+    /// Compute the native process manager socket path from options.
+    fn compute_socket_path(options: &DevenvOptions) -> Option<std::path::PathBuf> {
+        let devenv_dotfile = options.resolve_dotfile()?;
+        Some(devenv_processes::native_socket_path(&devenv_dotfile))
+    }
+
+    /// Send an API request to the native process manager.
+    async fn process_api_request(
+        &self,
+        request: &devenv_processes::ApiRequest,
+    ) -> Result<devenv_processes::ApiResponse, String> {
+        let socket_path = self
+            .process_socket_path
+            .as_ref()
+            .ok_or_else(|| "Could not determine process socket path".to_string())?;
+
+        devenv_processes::NativeProcessManager::api_request(socket_path, request)
+            .await
+            .map_err(|e| {
+                if socket_path.exists() {
+                    format!("Failed to communicate with process manager: {}", e)
+                } else {
+                    "No native process manager running. Start processes with 'devenv up -d' first."
+                        .to_string()
+                }
+            })
+    }
+
+    /// Send a process API request and format the response as JSON.
+    /// The `on_success` closure extracts the value from a successful (non-error) response.
+    async fn process_request_json<F>(
+        &self,
+        request: &devenv_processes::ApiRequest,
+        on_success: F,
+    ) -> String
+    where
+        F: FnOnce(devenv_processes::ApiResponse) -> Option<Value>,
+    {
+        match self.process_api_request(request).await {
+            Ok(devenv_processes::ApiResponse::Error { message }) => {
+                serde_json::to_string(&serde_json::json!({"error": message})).unwrap_or_default()
+            }
+            Ok(resp) => match on_success(resp) {
+                Some(value) => serde_json::to_string(&value).unwrap_or_default(),
+                None => serde_json::to_string(&serde_json::json!({"error": "unexpected response"}))
+                    .unwrap_or_default(),
+            },
+            Err(e) => serde_json::to_string(&serde_json::json!({"error": e})).unwrap_or_default(),
         }
     }
 
     async fn initialize(&self) -> Result<()> {
         info!("Initializing MCP server cache...");
 
-        // Create a single Devenv instance for all operations
-        let devenv_options = DevenvOptions {
-            config: self.config.clone(),
-            devenv_root: self.devenv_root.clone(),
-            ..Default::default()
-        };
-        let devenv = Devenv::new(devenv_options).await;
-
-        // Assemble once for all operations
-        devenv.assemble(true).await?;
+        let devenv = Devenv::new(self.options.clone()).await?;
 
         // Fetch and cache packages
         {
-            let _activity = Activity::operation("Caching packages").start();
+            let _activity = activity!(INFO, operation, "Caching packages");
             match self.fetch_packages_with_devenv(&devenv).await {
                 Ok(packages) => {
                     let mut cache = self.cache.write().await;
@@ -81,7 +120,7 @@ impl DevenvMcpServer {
 
         // Fetch and cache options
         {
-            let _activity = Activity::operation("Caching options").start();
+            let _activity = activity!(INFO, operation, "Caching options");
             match self.fetch_options_with_devenv(&devenv).await {
                 Ok(options) => {
                     let mut cache = self.cache.write().await;
@@ -101,10 +140,11 @@ impl DevenvMcpServer {
     async fn fetch_packages_with_devenv(&self, devenv: &Devenv) -> Result<Vec<PackageInfo>> {
         info!("Fetching available packages from nixpkgs...");
 
-        // Search for common/popular packages
-        // Note: Using ".*" would match all packages but causes resource exhaustion
-        // with the FFI backend due to GC pressure. Use a reasonable search term instead.
-        let search_results = devenv.nix.search("cachix", None).await?;
+        let search_results = devenv
+            .cnix()
+            .ok_or_else(|| miette!("search requires the C-Nix backend"))?
+            .search(".*", None)
+            .await?;
 
         let packages: Vec<PackageInfo> = search_results
             .into_iter()
@@ -131,19 +171,13 @@ impl DevenvMcpServer {
     async fn fetch_options_with_devenv(&self, devenv: &Devenv) -> Result<Vec<OptionInfo>> {
         info!("Fetching available configuration options...");
 
-        // Build the optionsJSON attribute like in devenv.rs search function
-        let build_options = Options {
-            cache_output: true,
-            ..Default::default()
-        };
-
         let options_paths = devenv
-            .nix
-            .build(&["optionsJSON"], Some(build_options), None)
+            .backend()
+            .build_devenv(&["optionsJSON"], BuildOptions::default())
             .await?;
 
-        // Read the options.json file from the build result
         let options_json_path = options_paths[0]
+            .as_path()
             .join("share")
             .join("doc")
             .join("nixos")
@@ -151,7 +185,7 @@ impl DevenvMcpServer {
 
         let options_content = tokio::fs::read_to_string(&options_json_path)
             .await
-            .map_err(|e| miette::miette!("Failed to read options.json: {}", e))?;
+            .map_err(|e| miette!("Failed to read options.json: {}", e))?;
 
         #[derive(Deserialize)]
         struct OptionResults(BTreeMap<String, OptionResult>);
@@ -165,7 +199,7 @@ impl DevenvMcpServer {
         }
 
         let options_json: OptionResults = serde_json::from_str(&options_content)
-            .map_err(|e| miette::miette!("Failed to parse options.json: {}", e))?;
+            .map_err(|e| miette!("Failed to parse options.json: {}", e))?;
 
         let options: Vec<OptionInfo> = options_json
             .0
@@ -247,6 +281,20 @@ struct SearchPackagesRequest {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct ProcessNameRequest {
+    #[schemars(description = "Name of the process")]
+    name: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct ProcessLogsRequest {
+    #[schemars(description = "Name of the process")]
+    name: String,
+    #[schemars(description = "Number of lines to return (default 100)")]
+    lines: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct SearchOptionsRequest {
     #[schemars(
         description = "Search string to filter options by name or description (e.g., 'python' or 'languages.python')"
@@ -256,33 +304,29 @@ struct SearchOptionsRequest {
 
 impl ServerHandler for DevenvMcpServer {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo {
-            instructions: Some("Devenv MCP server - provides access to devenv packages and configuration options. Process-compose logs are available in $DEVENV_STATE/process-compose/process-compose.log".into()),
-            capabilities: ServerCapabilities::builder().enable_tools().build(),
-            ..Default::default()
-        }
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            .with_instructions("Devenv MCP server - provides access to devenv packages and configuration options. Process-compose logs are available in $DEVENV_STATE/process-compose/process-compose.log")
     }
 
     fn list_tools(
         &self,
-        _request: Option<PaginatedRequestParam>,
+        _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> impl std::future::Future<Output = Result<ListToolsResult, McpError>> + Send + '_ {
         std::future::ready(Ok(ListToolsResult {
+            meta: None,
             tools: self.tool_router.list_all(),
             next_cursor: None,
         }))
     }
 
-    fn call_tool(
+    async fn call_tool(
         &self,
-        request: CallToolRequestParam,
+        request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
-    ) -> impl std::future::Future<Output = Result<CallToolResult, McpError>> + Send + '_ {
-        async move {
-            let tool_context = ToolCallContext::new(self, request, context);
-            self.tool_router.call(tool_context).await
-        }
+    ) -> Result<CallToolResult, McpError> {
+        let tool_context = ToolCallContext::new(self, request, context);
+        self.tool_router.call(tool_context).await
     }
 }
 
@@ -339,18 +383,105 @@ impl DevenvMcpServer {
 
         serde_json::to_string(&filtered_options).unwrap_or_default()
     }
+
+    #[tool(description = "List all managed processes and their status")]
+    async fn list_processes(&self) -> String {
+        use devenv_processes::{ApiRequest, ApiResponse};
+        self.process_request_json(&ApiRequest::List, |resp| match resp {
+            ApiResponse::ProcessList { processes } => serde_json::to_value(&processes).ok(),
+            _ => None,
+        })
+        .await
+    }
+
+    #[tool(description = "Get the status of a specific process")]
+    async fn get_process_status(&self, params: Parameters<ProcessNameRequest>) -> String {
+        use devenv_processes::{ApiRequest, ApiResponse};
+        self.process_request_json(
+            &ApiRequest::Status {
+                name: params.0.name,
+            },
+            |resp| match resp {
+                ApiResponse::ProcessDetail { info } => serde_json::to_value(&info).ok(),
+                _ => None,
+            },
+        )
+        .await
+    }
+
+    #[tool(description = "Get stdout and stderr logs for a process")]
+    async fn get_process_logs(&self, params: Parameters<ProcessLogsRequest>) -> String {
+        use devenv_processes::{ApiRequest, ApiResponse};
+        self.process_request_json(
+            &ApiRequest::Logs {
+                name: params.0.name,
+                lines: params.0.lines,
+            },
+            |resp| match resp {
+                ApiResponse::ProcessLogs { stdout, stderr } => {
+                    Some(serde_json::json!({"stdout": stdout, "stderr": stderr}))
+                }
+                _ => None,
+            },
+        )
+        .await
+    }
+
+    #[tool(description = "Restart a running process")]
+    async fn restart_process(&self, params: Parameters<ProcessNameRequest>) -> String {
+        use devenv_processes::ApiRequest;
+        self.process_request_json(
+            &ApiRequest::Restart {
+                name: params.0.name,
+            },
+            ok_response,
+        )
+        .await
+    }
+
+    #[tool(description = "Start a process that has auto start disabled")]
+    async fn start_process(&self, params: Parameters<ProcessNameRequest>) -> String {
+        use devenv_processes::ApiRequest;
+        self.process_request_json(
+            &ApiRequest::Start {
+                name: params.0.name,
+            },
+            ok_response,
+        )
+        .await
+    }
+
+    #[tool(description = "Stop a running process")]
+    async fn stop_process(&self, params: Parameters<ProcessNameRequest>) -> String {
+        use devenv_processes::ApiRequest;
+        self.process_request_json(
+            &ApiRequest::Stop {
+                name: params.0.name,
+            },
+            ok_response,
+        )
+        .await
+    }
 }
 
-pub async fn run_mcp_server(config: Config, http_port: Option<u16>) -> Result<()> {
+/// Shared success extractor for process action responses (restart, start, stop).
+fn ok_response(resp: devenv_processes::ApiResponse) -> Option<Value> {
+    match resp {
+        devenv_processes::ApiResponse::Ok => Some(serde_json::json!({"status": "ok"})),
+        _ => None,
+    }
+}
+
+pub async fn run_mcp_server(options: DevenvOptions, http_port: Option<u16>) -> Result<()> {
     info!("Starting devenv MCP server");
 
-    let server = DevenvMcpServer::new(config);
+    let server = DevenvMcpServer::new(options);
 
     // Initialize cache in background thread (Nix FFI futures are not Send)
     // Server starts immediately, tools return empty results until cache is ready
     // Activities from the background thread are sent to TUI via global channel
     let init_server = server.clone();
-    std::thread::Builder::new()
+    let init_handle = std::thread::Builder::new()
         .name("mcp-cache-init".into())
         .spawn(move || {
             let rt =
@@ -377,21 +508,22 @@ pub async fn run_mcp_server(config: Config, http_port: Option<u16>) -> Result<()
             let addr = format!("0.0.0.0:{}", port);
             let tcp_listener = tokio::net::TcpListener::bind(&addr)
                 .await
-                .map_err(|e| miette::miette!("Failed to bind to {}: {}", addr, e))?;
+                .map_err(|e| miette!("Failed to bind to {}: {}", addr, e))?;
 
             info!("MCP server ready at http://{}/", addr);
 
             // Show TUI progress for HTTP server
-            let _activity = Activity::operation("Running MCP server")
-                .detail(format!("http://0.0.0.0:{}/", port))
-                .start();
+            let _activity = devenv_activity::start!(
+                Activity::operation("Running MCP server")
+                    .detail(format!("http://0.0.0.0:{}/", port))
+            );
 
             axum::serve(tcp_listener, router)
                 .with_graceful_shutdown(async {
                     tokio::signal::ctrl_c().await.ok();
                 })
                 .await
-                .map_err(|e| miette::miette!("HTTP server error: {}", e))?;
+                .map_err(|e| miette!("HTTP server error: {}", e))?;
         }
         None => {
             info!("Starting MCP server in stdio mode");
@@ -399,14 +531,19 @@ pub async fn run_mcp_server(config: Config, http_port: Option<u16>) -> Result<()
             let service = server
                 .serve(rmcp::transport::stdio())
                 .await
-                .map_err(|e| miette::miette!("Failed to start MCP server: {}", e))?;
+                .map_err(|e| miette!("Failed to start MCP server: {}", e))?;
 
             service
                 .waiting()
                 .await
-                .map_err(|e| miette::miette!("MCP server error: {}", e))?;
+                .map_err(|e| miette!("MCP server error: {}", e))?;
         }
     }
+
+    // Wait for the init thread to finish before exiting.
+    init_handle
+        .join()
+        .map_err(|e| miette!("MCP cache init thread panicked: {:?}", e))?;
 
     Ok(())
 }
@@ -416,10 +553,10 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    #[cfg(feature = "integration-tests")]
+    #[cfg(feature = "test-mcp")]
     use devenv_nix_backend_macros::nix_test;
 
-    #[cfg(feature = "integration-tests")]
+    #[cfg(feature = "test-mcp")]
     async fn create_test_devenv_dir() -> std::io::Result<tempfile::TempDir> {
         let temp_dir = tempfile::tempdir()?;
 
@@ -508,7 +645,7 @@ mod tests {
     // 3. Network access to fetch packages
 
     #[nix_test]
-    #[cfg(feature = "integration-tests")]
+    #[cfg(feature = "test-mcp")]
     #[cfg(not(target_os = "linux"))] // Disabled on Linux due to segfaults
     async fn test_fetch_packages_live() {
         use crate::devenv::{Devenv, DevenvOptions};
@@ -516,18 +653,14 @@ mod tests {
         // Create temporary directory with test devenv configuration
         let temp_dir = create_test_devenv_dir().await.unwrap();
 
-        let config = Config::default();
-        let server =
-            DevenvMcpServer::new_with_root(config.clone(), Some(temp_dir.path().to_path_buf()));
-
-        // Create Devenv and assemble
-        let devenv_options = DevenvOptions {
-            config,
-            devenv_root: Some(temp_dir.path().to_path_buf()),
+        let devenv_root = Some(temp_dir.path().to_path_buf());
+        let options = DevenvOptions {
+            devenv_root,
             ..Default::default()
         };
-        let devenv = Devenv::new(devenv_options).await;
-        devenv.assemble(true).await.unwrap();
+        let server = DevenvMcpServer::new(options.clone());
+
+        let devenv = Devenv::new(options).await.unwrap();
 
         let packages = server.fetch_packages_with_devenv(&devenv).await;
 
@@ -584,7 +717,7 @@ mod tests {
     }
 
     #[nix_test]
-    #[cfg(feature = "integration-tests")]
+    #[cfg(feature = "test-mcp")]
     #[cfg(not(target_os = "linux"))] // Disabled on Linux due to segfaults
     async fn test_fetch_options_live() {
         use crate::devenv::{Devenv, DevenvOptions};
@@ -592,18 +725,14 @@ mod tests {
         // Create temporary directory with test devenv configuration
         let temp_dir = create_test_devenv_dir().await.unwrap();
 
-        let config = Config::default();
-        let server =
-            DevenvMcpServer::new_with_root(config.clone(), Some(temp_dir.path().to_path_buf()));
-
-        // Create Devenv and assemble
-        let devenv_options = DevenvOptions {
-            config,
-            devenv_root: Some(temp_dir.path().to_path_buf()),
+        let devenv_root = Some(temp_dir.path().to_path_buf());
+        let options = DevenvOptions {
+            devenv_root,
             ..Default::default()
         };
-        let devenv = Devenv::new(devenv_options).await;
-        devenv.assemble(true).await.unwrap();
+        let server = DevenvMcpServer::new(options.clone());
+
+        let devenv = Devenv::new(options).await.unwrap();
 
         let options = server.fetch_options_with_devenv(&devenv).await;
 

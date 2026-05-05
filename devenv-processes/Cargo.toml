@@ -9,14 +9,15 @@ description = "Native process management for devenv"
 async-trait.workspace = true
 devenv-activity.workspace = true
 devenv-event-sources.workspace = true
-daemonize.workspace = true
 futures.workspace = true
 miette.workspace = true
+netstat2.workspace = true
 nix.workspace = true
 process-wrap.workspace = true
+hex.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-shell-escape.workspace = true
+sha2.workspace = true
 signal-hook.workspace = true
 signal-hook-tokio.workspace = true
 socket2.workspace = true
@@ -30,6 +31,11 @@ portable-pty.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 caps.workspace = true
+
+[features]
+default = []
+test-all = ["test-file-watcher"]
+test-file-watcher = ["devenv-event-sources/macos-kqueue"]
 
 [dev-dependencies]
 sd-notify.workspace = true

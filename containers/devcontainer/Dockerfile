@@ -35,9 +35,9 @@ ENV PATH="/nix/var/nix/profiles/default/bin:${PATH}"
 RUN /nix-entrypoint.sh sleep 5
 
 # Install devenv and dependencies
-RUN nix profile install nixpkgs#direnv nixpkgs#cachix
+RUN nix profile add nixpkgs#direnv nixpkgs#cachix
 RUN USER=root cachix use devenv
-RUN nix profile install $DEVENV_INSTALL_URI --accept-flake-config
+RUN nix profile add $DEVENV_INSTALL_URI --accept-flake-config
 
 # Clean up
 RUN rm -rf ~/.cache/nix && \
@@ -50,7 +50,7 @@ USER vscode
 
 # Configure direnv
 RUN mkdir -p ~/.config/direnv
-RUN <<EOF > ~/.config/direnv/config.toml
+RUN cat <<EOF > ~/.config/direnv/config.toml
 [whitelist]
 prefix = [ "/workspaces" ]
 EOF

@@ -8,8 +8,11 @@
 //! the files from the current evaluation, not stale data from previous sessions.
 
 use crate::Devenv;
+use crate::devenv::{format_shell_exports, resolve_shell_path};
+use devenv_core::config::Clean;
 use devenv_reload::{BuildContext, BuildError, CommandBuilder, ShellBuilder};
-use devenv_shell::dialect::{BashDialect, RcfileContext, ShellDialect};
+use devenv_shell::dialect::{BashDialect, RcfileContext, ShellDialect, create_dialect};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use tokio::runtime::Handle;
 use tokio::sync::Mutex;
@@ -28,20 +31,29 @@ pub struct DevenvShellBuilder {
     initial_env_script: String,
     /// Pre-computed bash path
     bash_path: String,
+    /// Resolved clean config (already merged from CLI and devenv.yaml)
+    clean: Clean,
     /// Dotfile directory path
     dotfile: std::path::PathBuf,
     /// Eval cache pool (from original devenv, to query file inputs for watching)
     eval_cache_pool: Option<sqlx::SqlitePool>,
     /// Shell cache key (from original devenv, to query file inputs for watching)
     shell_cache_key: Option<devenv_eval_cache::EvalCacheKey>,
+    /// Environment variables exported by enterShell tasks (e.g. VIRTUAL_ENV, PATH from venv)
+    task_exports: BTreeMap<String, String>,
+    /// Messages from enterShell tasks to display when entering the shell
+    task_messages: Vec<String>,
+    /// Target shell name (e.g., "bash", "zsh")
+    shell: String,
 }
 
 impl DevenvShellBuilder {
     /// Create a new DevenvShellBuilder.
     ///
     /// The provided Devenv instance will be used for all builds.
-    /// The `initial_env_script` and `bash_path` are pre-computed while TUI is active
-    /// to avoid deadlocks (get_dev_environment has #[activity] which needs TUI).
+    /// The `initial_env_script`, `bash_path`, and `clean` are read from the
+    /// already-merged config before the coordinator starts (to avoid deadlocks
+    /// with the TUI and async locks).
     /// The `eval_cache_pool` and `shell_cache_key` are from the original devenv
     /// (needed because the new devenv instance hasn't done assemble() yet).
     pub fn new(
@@ -51,9 +63,13 @@ impl DevenvShellBuilder {
         args: Vec<String>,
         initial_env_script: String,
         bash_path: String,
+        clean: Clean,
         dotfile: std::path::PathBuf,
         eval_cache_pool: Option<sqlx::SqlitePool>,
         shell_cache_key: Option<devenv_eval_cache::EvalCacheKey>,
+        task_exports: BTreeMap<String, String>,
+        task_messages: Vec<String>,
+        shell: String,
     ) -> Self {
         Self {
             handle,
@@ -62,9 +78,13 @@ impl DevenvShellBuilder {
             args,
             initial_env_script,
             bash_path,
+            clean,
             dotfile,
             eval_cache_pool,
             shell_cache_key,
+            task_exports,
+            task_messages,
+            shell,
         }
     }
 }
@@ -78,12 +98,26 @@ impl ShellBuilder for DevenvShellBuilder {
         if self.cmd.is_none() {
             let bash = &self.bash_path;
 
-            // Write the devenv environment script to a file
+            // Write the devenv environment script to a file, appending task exports
+            // (e.g. VIRTUAL_ENV, PATH with venv) after the Nix shell env so they take precedence.
             let env_script_path = self.dotfile.join("shell-env.sh");
-            std::fs::write(&env_script_path, &self.initial_env_script)
+            let mut env_script = self.initial_env_script.clone();
+            env_script.push_str(&format_shell_exports(&self.task_exports));
+            env_script.push_str(&BashDialect.format_task_messages(&self.task_messages));
+            std::fs::write(&env_script_path, &env_script)
                 .map_err(|e| BuildError::new(format!("Failed to write env script: {}", e)))?;
 
-            let dialect = BashDialect;
+            // Select dialect based on configured shell
+            tracing::debug!("Shell setting: {:?}", self.shell);
+            let dialect = create_dialect(&self.shell);
+            let target_shell_path = if dialect.name() != "bash" {
+                let path = resolve_shell_path(dialect.name());
+                tracing::debug!("Resolved {} shell path: {}", dialect.name(), path);
+                Some(path)
+            } else {
+                None
+            };
+
             let env_diff_helpers = dialect.env_diff_helpers();
 
             let reload_hook = if let Some(ref reload_file) = ctx.reload_file {
@@ -92,11 +126,20 @@ impl ShellBuilder for DevenvShellBuilder {
                 String::new()
             };
 
-            let rcfile_content = dialect.rcfile_content(&RcfileContext {
+            let rcfile_ctx = RcfileContext {
                 env_script_path: &env_script_path,
                 env_diff_helpers,
                 reload_hook: &reload_hook,
-            });
+                target_shell_path: target_shell_path.as_deref(),
+                init_dir: &self.dotfile,
+            };
+
+            let rcfile_content = dialect.rcfile_content(&rcfile_ctx);
+
+            // Write supplementary init files (e.g., zsh's ZDOTDIR .zshrc)
+            dialect
+                .write_init_files(&rcfile_ctx)
+                .map_err(|e| BuildError::new(format!("Failed to write init files: {}", e)))?;
 
             let rcfile_path = self.dotfile.join("shell-rcfile.sh");
             std::fs::write(&rcfile_path, &rcfile_content)
@@ -122,6 +165,11 @@ impl ShellBuilder for DevenvShellBuilder {
                     reload_file.to_string_lossy().to_string(),
                 );
             }
+
+            // Apply clean/keep env filtering and standard shell env vars.
+            // Use target shell path for SHELL env var when available.
+            let shell_for_env = target_shell_path.as_deref().unwrap_or(bash);
+            crate::shell_env::apply_shell_env(&mut cmd_builder, shell_for_env, &self.clean);
 
             // Add watch paths from eval cache
             self.handle.block_on(async {
@@ -221,7 +269,9 @@ impl ShellBuilder for DevenvShellBuilder {
             let devenv = devenv.lock().await;
 
             // Invalidate cached state to force re-evaluation on file changes
-            devenv.invalidate_for_reload();
+            devenv.invalidate_for_reload().await.map_err(|e| {
+                BuildError::new(format!("Failed to invalidate state for reload: {}", e))
+            })?;
 
             // Get the bash environment script (like direnv's print-dev-env)
             let env_script = devenv
@@ -242,11 +292,12 @@ impl ShellBuilder for DevenvShellBuilder {
                     .await
                 {
                     Ok(inputs) => {
-                        for input in inputs {
-                            if input.path.exists() && !input.path.starts_with("/nix/store") {
-                                watcher.watch(&input.path);
-                            }
-                        }
+                        let paths: Vec<_> = inputs
+                            .into_iter()
+                            .filter(|i| i.path.exists() && !i.path.starts_with("/nix/store"))
+                            .map(|i| i.path)
+                            .collect();
+                        watcher.watch_many(paths).await;
                     }
                     Err(e) => {
                         tracing::warn!("Failed to query eval cache for shell inputs: {}", e);
@@ -256,6 +307,10 @@ impl ShellBuilder for DevenvShellBuilder {
 
             Ok(())
         })
+    }
+
+    fn interrupt(&self) {
+        devenv_nix_backend::trigger_interrupt();
     }
 }
 
@@ -278,11 +333,12 @@ impl DevenvShellBuilder {
             match devenv_eval_cache::get_file_inputs_by_key_hash(pool, &cache_key.key_hash).await {
                 Ok(inputs) if !inputs.is_empty() => {
                     tracing::debug!("Found {} file inputs for shell key", inputs.len());
-                    for input in inputs {
-                        if input.path.exists() && !input.path.starts_with("/nix/store") {
-                            ctx.watcher.watch(&input.path);
-                        }
-                    }
+                    let paths: Vec<_> = inputs
+                        .into_iter()
+                        .filter(|i| i.path.exists() && !i.path.starts_with("/nix/store"))
+                        .map(|i| i.path)
+                        .collect();
+                    ctx.watcher.watch_many(paths).await;
                     return;
                 }
                 Ok(_) => {
@@ -298,11 +354,11 @@ impl DevenvShellBuilder {
         match devenv_eval_cache::get_all_tracked_file_paths(pool).await {
             Ok(paths) => {
                 tracing::debug!("Found {} total tracked files in eval cache", paths.len());
-                for path in paths {
-                    if path.exists() && !path.starts_with("/nix/store") {
-                        ctx.watcher.watch(&path);
-                    }
-                }
+                let filtered: Vec<_> = paths
+                    .into_iter()
+                    .filter(|p| p.exists() && !p.starts_with("/nix/store"))
+                    .collect();
+                ctx.watcher.watch_many(filtered).await;
             }
             Err(e) => {
                 tracing::warn!("Failed to query all tracked files: {}", e);

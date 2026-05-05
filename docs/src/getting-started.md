@@ -106,7 +106,6 @@ Initialize a new developer environment with `devenv init`.
 
 ```shell-session
 $ devenv init
-• Creating .envrc
 • Creating devenv.nix
 • Creating devenv.yaml
 • Creating .gitignore
@@ -114,16 +113,26 @@ $ devenv init
 
 ## Commands
 
-- ``devenv test`` builds your developer environment and makes sure that all checks pass. Useful to run in your continuous integration environment.
+- ``devenv init`` scaffolds a new project with ``devenv.yaml``, ``devenv.nix``, and ``.gitignore``.
 - ``devenv shell`` activates your developer environment.
+- ``devenv test`` builds your developer environment and makes sure that all checks pass. Useful to run in your continuous integration environment.
 - ``devenv search <NAME>`` searches packages matching NAME in Nixpkgs input.
 - ``devenv update`` updates and pins inputs from ``devenv.yaml`` into ``devenv.lock``.
 - ``devenv gc`` [deletes unused environments](garbage-collection.md) to save disk space.
 - ``devenv up`` starts [processes](processes.md).
+- ``devenv processes down`` stops background processes.
+- ``devenv info`` prints environment information.
+- ``devenv build <attr>`` builds attributes from ``devenv.nix``.
+- ``devenv eval <attr>`` evaluates attributes and returns JSON.
+- ``devenv repl`` launches an interactive Nix REPL for inspecting the environment.
+- ``devenv tasks run <task>`` runs [tasks](tasks.md).
+- ``devenv container build|copy|run`` manages [containers](containers.md).
+- ``devenv inputs add <name> <url>`` adds an input to ``devenv.yaml``.
+- ``devenv lsp`` starts the language server for ``devenv.nix``.
+- ``devenv mcp`` launches the MCP server for AI assistants.
 
 ## Learn more
 
-- About ``.envrc`` in [direnv integration](integrations/direnv.md).
 - About ``devenv.yaml`` in [Inputs](inputs.md) and [Composing using imports](composing-using-imports.md).
 - About ``devenv.nix`` in the **Writing devenv.nix** section, starting with [the basics](basics.md).
 

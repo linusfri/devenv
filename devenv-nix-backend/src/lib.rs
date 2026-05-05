@@ -1,16 +1,23 @@
 use anyhow::{Context, Result};
-use devenv_core::config::Config;
+use devenv_core::config::Input;
+use nix_bindings_expr::eval_state::EvalState;
 use nix_bindings_fetchers::FetchersSettings;
 use nix_bindings_flake::{
-    FlakeInput, FlakeInputs, FlakeReference, FlakeReferenceParseFlags, FlakeSettings, LockFile,
+    FlakeInput, FlakeInputs, FlakeReference, FlakeReferenceParseFlags, FlakeSettings, InputsLocker,
+    LockFile, LockMode,
 };
 use nix_bindings_store::store::Store;
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Once;
 
-// Export the NixBackend implementation
-pub mod nix_backend;
-pub use nix_backend::ProjectRoot;
+pub mod backend;
+pub use backend::{NixCBackend, ProjectRoot};
+
+pub mod cnix_store;
+pub use cnix_store::CNixStore;
+
+pub mod lock;
 
 use std::cell::RefCell;
 
@@ -22,12 +29,31 @@ thread_local! {
     static GC_REGISTRATION: RefCell<Option<nix_bindings_expr::eval_state::ThreadRegistrationGuard>> = const { RefCell::new(None) };
 }
 
+/// Trigger the Nix interrupt flag to abort any in-progress Nix evaluation.
+///
+/// This sets a process-global flag that the Nix evaluator checks periodically.
+/// When set, the evaluator throws an error and aborts the current operation.
+///
+/// Safe to call even when no Nix operation is running — the flag is simply set
+/// and will be checked when the next evaluation starts.
+pub fn trigger_interrupt() {
+    nix_bindings_util::trigger_interrupt();
+}
+
 /// Initialize the Nix expression library and Boehm GC.
 ///
 /// This is safe to call multiple times - initialization only happens once.
 /// Must be called before any thread tries to register with GC.
 pub fn nix_init() {
     NIX_INIT.call_once(|| {
+        // Suppress Boehm GC "Repeated allocation of very large block" warnings.
+        // These are harmless and would otherwise be printed directly to stderr,
+        // bypassing our activity logger.
+        if std::env::var_os("GC_LARGE_ALLOC_WARN_INTERVAL").is_none() {
+            // SAFETY: Called once during single-threaded initialization (inside Once::call_once)
+            // before any worker threads are spawned.
+            unsafe { std::env::set_var("GC_LARGE_ALLOC_WARN_INTERVAL", "1000000") };
+        }
         nix_bindings_expr::eval_state::init().expect("Failed to initialize Nix expression library");
     });
 }
@@ -83,16 +109,25 @@ pub mod build_environment;
 // Cachix daemon client for pushing store paths
 pub mod cachix_daemon;
 
+// Wire protocol types for the cachix daemon socket
+pub mod cachix_protocol;
+
+// Scoped umask guard for Nix C API calls
+pub mod umask_guard;
+
+// Helpers for shaping Nix errors into miette diagnostics
+mod error;
+
 /// Convert devenv inputs to FlakeInputs
 ///
 /// # Arguments
 /// * `fetch_settings` - Fetcher configuration
 /// * `flake_settings` - Flake configuration
-/// * `config` - Devenv configuration
+/// * `inputs` - Input specifications from devenv.yaml
 pub fn create_flake_inputs(
     fetch_settings: &FetchersSettings,
     flake_settings: &FlakeSettings,
-    config: &Config,
+    inputs: &BTreeMap<String, Input>,
 ) -> Result<FlakeInputs> {
     let mut flake_inputs = FlakeInputs::new()?;
 
@@ -101,7 +136,7 @@ pub fn create_flake_inputs(
     parse_flags.set_preserve_relative_paths(true)?;
 
     // Convert each devenv input to a FlakeInput
-    for (name, input) in config.inputs.iter() {
+    for (name, input) in inputs.iter() {
         let mut flake_input = if let Some(url) = &input.url {
             let (flake_ref, _fragment) = FlakeReference::parse_with_fragment(
                 fetch_settings,
@@ -175,7 +210,7 @@ pub fn create_flake_inputs(
     }
 
     // Add nixpkgs as a default input if not already specified
-    if !config.inputs.contains_key("nixpkgs") {
+    if !inputs.contains_key("nixpkgs") {
         let nixpkgs_url = "github:cachix/devenv-nixpkgs/rolling";
         let (flake_ref, _fragment) = FlakeReference::parse_with_fragment(
             fetch_settings,
@@ -188,7 +223,7 @@ pub fn create_flake_inputs(
     }
 
     // Add devenv as a default input if not already specified
-    if !config.inputs.contains_key("devenv") {
+    if !inputs.contains_key("devenv") {
         let devenv_url = "github:cachix/devenv?dir=src/modules";
         let (flake_ref, _fragment) = FlakeReference::parse_with_fragment(
             fetch_settings,
@@ -225,13 +260,170 @@ pub fn write_lock_file(lock_file: &LockFile, output_path: &Path) -> Result<()> {
     let lock_json = lock_file.to_string()?;
     // Compare with existing content to avoid updating mtime unnecessarily.
     // direnv watches devenv.lock and uses mtime to detect changes.
-    if let Ok(existing) = std::fs::read_to_string(output_path) {
-        if existing == lock_json {
-            return Ok(());
-        }
+    if let Ok(existing) = std::fs::read_to_string(output_path)
+        && existing == lock_json
+    {
+        return Ok(());
     }
     std::fs::write(output_path, &lock_json)
         .with_context(|| format!("Failed to write lock file to {}", output_path.display()))?;
+    Ok(())
+}
+
+/// Lock the requested inputs against an existing lock file (if any) and write
+/// the result to `<root>/devenv.lock`.
+///
+/// `input_name = Some(name)` updates a single input; `None` updates all.
+/// `override_inputs` is a flat list of `[name, url, name, url, ...]` parsed
+/// in pairs.
+///
+/// The caller owns the [`EvalState`] lock; this function makes one synchronous
+/// FFI call into the locker and writes the lock file on success.
+pub fn lock_inputs(
+    eval_state: &EvalState,
+    fetch_settings: &FetchersSettings,
+    flake_settings: &FlakeSettings,
+    root: &Path,
+    inputs: &BTreeMap<String, Input>,
+    input_name: Option<&str>,
+    override_inputs: &[String],
+) -> Result<()> {
+    let flake_inputs = create_flake_inputs(fetch_settings, flake_settings, inputs)
+        .context("Failed to create flake inputs")?;
+
+    let lock_file_path = root.join("devenv.lock");
+    let old_lock =
+        load_lock_file(fetch_settings, &lock_file_path).context("Failed to load lock file")?;
+
+    let base_dir_str = root.to_str().context("Root path contains invalid UTF-8")?;
+    // Nix's resolveRelativePath uses parent() on the source_path to get the directory.
+    // Since it expects a file path (like flake.nix), we append devenv.nix so parent() returns the root.
+    let source_path = root.join("devenv.nix");
+    let source_path_str = source_path
+        .to_str()
+        .context("Source path contains invalid UTF-8")?;
+
+    let mut locker = InputsLocker::new(flake_settings)
+        .with_inputs(flake_inputs)
+        .source_path(source_path_str)
+        .mode(LockMode::Virtual)
+        .use_registries(true);
+
+    if let Some(lock) = &old_lock {
+        locker = locker.old_lock_file(lock);
+    }
+
+    if let Some(name) = input_name {
+        locker = locker.update_input(name);
+    } else {
+        locker = locker.update_all();
+    }
+
+    let overrides: Vec<(String, FlakeReference)> = if !override_inputs.is_empty() {
+        let mut parse_flags = FlakeReferenceParseFlags::new(flake_settings)?;
+        parse_flags.set_base_directory(base_dir_str)?;
+
+        override_inputs
+            .chunks_exact(2)
+            .map(|pair| {
+                let (override_ref, _) = FlakeReference::parse_with_fragment(
+                    fetch_settings,
+                    flake_settings,
+                    &parse_flags,
+                    &pair[1],
+                )?;
+                Ok((pair[0].clone(), override_ref))
+            })
+            .collect::<Result<Vec<_>>>()
+            .context("Failed to parse input overrides")?
+    } else {
+        Vec::new()
+    };
+
+    if !overrides.is_empty() {
+        locker = locker.overrides(overrides.iter().map(|(name, r)| (name.clone(), r)));
+    }
+
+    let lock_file = {
+        let _guard = crate::umask_guard::UmaskGuard::restrictive();
+        locker
+            .lock(fetch_settings, eval_state)
+            .context("Failed to lock inputs")?
+    };
+
+    write_lock_file(&lock_file, &lock_file_path).context("Failed to write lock file")?;
+
+    Ok(())
+}
+
+/// Validate the existing lock file against the current inputs, regenerating it
+/// if missing, unparseable, or out of date.
+///
+/// On success, `<root>/devenv.lock` exists and is consistent with `inputs`.
+pub fn validate_lock_file(
+    eval_state: &EvalState,
+    fetch_settings: &FetchersSettings,
+    flake_settings: &FlakeSettings,
+    root: &Path,
+    inputs: &BTreeMap<String, Input>,
+) -> Result<()> {
+    let lock_file_path = root.join("devenv.lock");
+
+    if !lock_file_path.exists() {
+        return lock_inputs(
+            eval_state,
+            fetch_settings,
+            flake_settings,
+            root,
+            inputs,
+            None,
+            &[],
+        );
+    }
+
+    let old_lock =
+        load_lock_file(fetch_settings, &lock_file_path).context("Failed to load lock file")?;
+    let Some(old_lock) = old_lock else {
+        return lock_inputs(
+            eval_state,
+            fetch_settings,
+            flake_settings,
+            root,
+            inputs,
+            None,
+            &[],
+        );
+    };
+
+    let flake_inputs = create_flake_inputs(fetch_settings, flake_settings, inputs)
+        .context("Failed to create flake inputs")?;
+
+    let source_path = root.join("devenv.nix");
+    let source_path_str = source_path
+        .to_str()
+        .context("Source path contains invalid UTF-8")?;
+
+    // Virtual mode so unlocked local inputs don't fail validation;
+    // we compare the computed lock against the existing one to detect drift.
+    let locker = InputsLocker::new(flake_settings)
+        .with_inputs(flake_inputs)
+        .source_path(source_path_str)
+        .old_lock_file(&old_lock)
+        .mode(LockMode::Virtual)
+        .use_registries(true);
+
+    let lock_result = {
+        let _guard = crate::umask_guard::UmaskGuard::restrictive();
+        locker.lock(fetch_settings, eval_state)
+    };
+
+    let new_lock = lock_result.context("Lock validation failed")?;
+    if new_lock.has_changes(&old_lock)? {
+        tracing::debug!("Lock validation found changes, writing updated lock");
+        // Writing new_lock directly avoids re-fetching every input: it was
+        // computed with old_lock as a base, so unchanged inputs are preserved.
+        write_lock_file(&new_lock, &lock_file_path).context("Failed to write lock file")?;
+    }
     Ok(())
 }
 
@@ -244,7 +436,11 @@ pub fn write_lock_file(lock_file: &LockFile, output_path: &Path) -> Result<()> {
 ///
 /// Returns a hex-encoded BLAKE3 hash of the combined fingerprints.
 /// If no lock file exists or no inputs have fingerprints, returns the hash of an empty string.
-pub fn compute_lock_fingerprint(lock_file: Option<&LockFile>, store: &Store) -> Result<String> {
+pub fn compute_lock_fingerprint(
+    lock_file: Option<&LockFile>,
+    fetch_settings: &FetchersSettings,
+    store: &Store,
+) -> Result<String> {
     let mut parts: Vec<String> = Vec::new();
 
     if let Some(lock) = lock_file {
@@ -253,7 +449,7 @@ pub fn compute_lock_fingerprint(lock_file: Option<&LockFile>, store: &Store) -> 
         // The iterator starts pointing at the first element
         loop {
             let attr_path = iter.attr_path()?;
-            if let Some(fingerprint) = iter.fingerprint(store)? {
+            if let Some(fingerprint) = iter.fingerprint(fetch_settings, store)? {
                 tracing::debug!("attr_path: {}, fingerprint: {}", attr_path, fingerprint);
                 parts.push(format!("{}={}", attr_path, fingerprint));
             }
@@ -267,6 +463,5 @@ pub fn compute_lock_fingerprint(lock_file: Option<&LockFile>, store: &Store) -> 
     parts.sort();
 
     let combined = parts.join(";");
-    let hash = blake3::hash(combined.as_bytes());
-    Ok(hash.to_hex().to_string())
+    Ok(devenv_cache_core::compute_string_hash(&combined))
 }

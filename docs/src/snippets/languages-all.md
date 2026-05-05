@@ -25,6 +25,7 @@
   languages.julia.enable = true;
   languages.kotlin.enable = true;
   languages.lean4.enable = true;
+  languages.lobster.enable = true;
   languages.lua.enable = true;
   languages.nim.enable = true;
   languages.nix.enable = true;
@@ -34,6 +35,7 @@
   languages.pascal.enable = true;
   languages.perl.enable = true;
   languages.php.enable = true;
+  languages.pkl.enable = true;
   languages.purescript.enable = true;
   languages.python.enable = true;
   languages.r.enable = true;

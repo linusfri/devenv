@@ -7,40 +7,265 @@ use devenv_cache_core::{
     file::TrackedFile,
     time,
 };
-use glob::{MatchOptions, glob_with};
+use ignore::Match;
+use ignore::WalkBuilder;
+use ignore::overrides::OverrideBuilder;
 use serde_json::Value;
 use sqlx::Row;
-use std::path::PathBuf;
-use std::time::SystemTime;
+use std::collections::{BTreeMap, HashSet};
+use std::path::{Path, PathBuf};
 use tracing::{debug, warn};
 
-/// Expand glob patterns into actual file paths
+const GLOB_SPECIAL_CHARS: &[char] = &['*', '?', '[', '{'];
+
+fn normalize_pattern_for_base_dir(pattern: &str, base_dir: &Path) -> String {
+    let (negated, raw_pattern) = match pattern.strip_prefix('!') {
+        Some(rest) => (true, rest),
+        None => (false, pattern),
+    };
+
+    let base_dir_str = base_dir.to_string_lossy();
+    let stripped = if let Some(rest) = raw_pattern.strip_prefix(&format!("{}/", base_dir_str)) {
+        rest
+    } else if raw_pattern == base_dir_str {
+        "."
+    } else {
+        raw_pattern
+    };
+
+    // `ignore` treats patterns without a path separator as basename matches at any depth.
+    // After stripping the base directory, we can accidentally turn anchored patterns like
+    // `src/*.ts` into `*.ts`, which would match files in subdirectories too.
+    //
+    // Preserve the old glob expansion semantics by anchoring single-segment patterns
+    // to the base directory root.
+    let stripped = if stripped.is_empty()
+        || stripped == "."
+        || stripped.starts_with('/')
+        || stripped.contains('/')
+    {
+        stripped.to_string()
+    } else {
+        format!("/{}", stripped)
+    };
+
+    if negated {
+        format!("!{}", stripped)
+    } else {
+        stripped
+    }
+}
+
+fn is_literal_pattern(pattern: &str) -> bool {
+    !pattern.contains(GLOB_SPECIAL_CHARS)
+}
+
+fn pattern_explicitly_targets_hidden_path(pattern: &str) -> bool {
+    let raw = pattern.strip_prefix('!').unwrap_or(pattern);
+    raw.starts_with('.') || raw.starts_with("/.") || raw.contains("/.")
+}
+
+fn has_hidden_component(path: &Path, base_dir: &Path) -> bool {
+    let relative = path.strip_prefix(base_dir).unwrap_or(path);
+    relative.components().any(|component| {
+        component
+            .as_os_str()
+            .to_str()
+            .is_some_and(|segment| segment.starts_with('.') && segment != "." && segment != "..")
+    })
+}
+
+/// Extract the base directory from a glob pattern.
 ///
-/// The expansion uses strict matching rules:
-/// - `case_sensitive: true` – patterns are case-sensitive (e.g. `*.RS` will not match `main.rs`)
-/// - `require_literal_separator: true` – path separators must appear literally in the pattern
-///   (e.g. `src**/*.rs` is invalid and will not match anything)
-/// - `require_literal_leading_dot: true` – a leading dot must be written explicitly
-///   (e.g. `*` will not match `.hidden`, you must use `.*` or `.hidden` directly)
-pub fn expand_glob_patterns(patterns: &[String]) -> Vec<String> {
-    patterns
+/// Returns the longest path prefix that doesn't contain glob special characters.
+/// This is used to determine where to start walking the filesystem.
+fn extract_base_dir(pattern: &str) -> &Path {
+    // Find the first occurrence of any glob special character
+    let first_special = pattern
+        .char_indices()
+        .find(|(_, c)| GLOB_SPECIAL_CHARS.contains(c))
+        .map(|(i, _)| i)
+        .unwrap_or(pattern.len());
+
+    // No glob characters - treat as a literal path and walk from its parent directory
+    if first_special == pattern.len() {
+        let path = Path::new(pattern);
+        if let Some(parent) = path.parent() {
+            if parent.as_os_str().is_empty() {
+                return Path::new(".");
+            }
+
+            return parent;
+        }
+
+        return Path::new(".");
+    }
+
+    // Get the substring up to the first special character
+    let prefix = &pattern[..first_special];
+
+    // Find the last path separator in the prefix to get the directory
+    match prefix.rfind(std::path::MAIN_SEPARATOR) {
+        Some(last_sep) => {
+            if last_sep == 0 {
+                Path::new(&pattern[..=last_sep])
+            } else {
+                Path::new(&pattern[..last_sep])
+            }
+        }
+        None => {
+            // No separator before the first wildcard means the wildcard is in the first segment.
+            // Walk from cwd so patterns like `src*/*.ts` can match `src1/...`, `src2/...`, etc.
+            Path::new(".")
+        }
+    }
+}
+
+/// Walks the filesystem from each pattern's base directory and returns the
+/// concrete paths that match.
+///
+/// This is not a pure pattern transformation — it performs filesystem I/O via
+/// `ignore::WalkBuilder`. Each call traverses the matched directory trees, so
+/// callers should avoid invoking it multiple times for the same pattern set.
+///
+/// Negation patterns (starting with `!`) are supported to exclude paths:
+/// - `!**/node_modules/**` – excludes all paths containing node_modules
+/// - `!**/*.test.ts` – excludes all test files
+///
+/// Example: `["**/*.ts", "!**/node_modules/**"]` matches all TypeScript files
+/// except those in node_modules directories.
+pub fn find_files_matching_patterns(patterns: &[String]) -> Vec<String> {
+    // Separate positive patterns from negation patterns
+    let (negation_patterns, positive_patterns): (Vec<&str>, Vec<&str>) = patterns
         .iter()
-        .flat_map(|pattern| {
-            glob_with(
-                pattern,
-                MatchOptions {
-                    case_sensitive: true,
-                    require_literal_separator: true,
-                    require_literal_leading_dot: true,
-                },
-            )
-            .ok()
-            .into_iter()
-            .flatten()
-            .filter_map(|path| path.ok())
-            .filter_map(|path| path.to_str().map(String::from))
-        })
-        .collect()
+        .map(|s| s.as_str())
+        .partition(|p| p.starts_with('!'));
+
+    // `exec_if_modified` requires at least one positive pattern.
+    if positive_patterns.is_empty() {
+        return Vec::new();
+    }
+
+    let mut results: Vec<String> = Vec::new();
+    let mut groups: BTreeMap<PathBuf, Vec<&str>> = BTreeMap::new();
+    for pattern in &positive_patterns {
+        if is_literal_pattern(pattern) {
+            let path = Path::new(pattern);
+            if path.exists()
+                && let Some(path_str) = path.to_str()
+            {
+                results.push(path_str.to_string());
+            }
+            continue;
+        }
+
+        groups
+            .entry(extract_base_dir(pattern).to_path_buf())
+            .or_default()
+            .push(*pattern);
+    }
+
+    for (base_dir, positive_group) in groups {
+        let mut overrides_builder = OverrideBuilder::new(&base_dir);
+        let mut hidden_overrides_builder = OverrideBuilder::new(&base_dir);
+
+        for pattern in positive_group.iter().chain(negation_patterns.iter()) {
+            let normalized = normalize_pattern_for_base_dir(pattern, &base_dir);
+            if let Err(e) = overrides_builder.add(&normalized) {
+                warn!("Invalid glob pattern '{}': {}", normalized, e);
+            }
+            if pattern_explicitly_targets_hidden_path(&normalized)
+                && let Err(e) = hidden_overrides_builder.add(&normalized)
+            {
+                warn!("Invalid hidden glob pattern '{}': {}", normalized, e);
+            }
+        }
+
+        // We build overrides twice: once for the walker (efficient directory pruning)
+        // and once for explicit match checking. The walker yields entries that are
+        // *not ignored* (including directories that match no rule), so we use
+        // overrides_for_match to select only positively matched files.
+        let overrides_for_match = match overrides_builder.build() {
+            Ok(overrides) => overrides,
+            Err(e) => {
+                warn!("Failed to build ignore overrides: {e}");
+                continue;
+            }
+        };
+        let overrides_for_walk = match overrides_builder.build() {
+            Ok(overrides) => overrides,
+            Err(e) => {
+                warn!("Failed to build ignore overrides: {e}");
+                continue;
+            }
+        };
+        let hidden_overrides = match hidden_overrides_builder.build() {
+            Ok(overrides) => overrides,
+            Err(e) => {
+                warn!("Failed to build hidden ignore overrides: {e}");
+                continue;
+            }
+        };
+
+        let mut walk_builder = WalkBuilder::new(&base_dir);
+        walk_builder
+            .hidden(false)
+            .ignore(true)
+            .git_ignore(true)
+            .git_global(true)
+            .git_exclude(true)
+            .parents(true)
+            .follow_links(true)
+            .overrides(overrides_for_walk);
+
+        for entry in walk_builder.build() {
+            let Ok(entry) = entry else {
+                continue;
+            };
+
+            let is_dir = entry.file_type().is_some_and(|ft| ft.is_dir());
+            if matches!(
+                overrides_for_match.matched(entry.path(), is_dir),
+                Match::Whitelist(_)
+            ) {
+                if has_hidden_component(entry.path(), &base_dir)
+                    && !matches!(
+                        hidden_overrides.matched(entry.path(), is_dir),
+                        Match::Whitelist(_)
+                    )
+                {
+                    continue;
+                }
+
+                if let Some(path_str) = entry.path().to_str() {
+                    results.push(path_str.to_string());
+                }
+            }
+        }
+    }
+
+    // Filter literal paths against negation patterns.
+    // Glob results are already filtered by the walker above.
+    if !negation_patterns.is_empty() {
+        let base = Path::new("/");
+        let mut builder = OverrideBuilder::new(base);
+        for neg in &negation_patterns {
+            let normalized = normalize_pattern_for_base_dir(neg, base);
+            if let Err(e) = builder.add(&normalized) {
+                warn!("Invalid negation pattern '{}': {}", normalized, e);
+            }
+        }
+        if let Ok(overrides) = builder.build() {
+            results.retain(|path_str| {
+                !matches!(
+                    overrides.matched(Path::new(path_str), false),
+                    Match::Ignore(_)
+                )
+            });
+        }
+    }
+
+    results
 }
 
 // Create a constant for embedded migrations
@@ -54,7 +279,7 @@ pub struct TaskCache {
 
 impl TaskCache {
     /// Create a new TaskCache with the given cache directory.
-    pub async fn new(cache_dir: &PathBuf) -> CacheResult<Self> {
+    pub async fn new(cache_dir: &Path) -> CacheResult<Self> {
         let db_path = cache_dir.join("tasks.db");
         Self::with_db_path(db_path).await
     }
@@ -78,42 +303,106 @@ impl TaskCache {
     ///
     /// Returns true if any of the files have been modified since the last time
     /// the task was run, or if this is the first time checking these files.
-    pub async fn check_modified_files(
+    /// Check whether any of the given concrete paths have changed since the
+    /// last cached run. Does not walk the filesystem — caller is responsible
+    /// for resolving glob patterns to paths via [`find_files_matching_patterns`].
+    ///
+    /// Callers that hold the expanded path list (e.g. to also call
+    /// [`Self::has_removed_files`]) should use this directly to avoid walking
+    /// the filesystem twice.
+    pub async fn check_paths_modified(
         &self,
         task_name: &str,
-        files: &[String],
+        paths: &[String],
     ) -> CacheResult<bool> {
-        if files.is_empty() {
-            return Ok(false);
-        }
-
-        // Expand all patterns using glob and collect results
-        let expanded_paths = expand_glob_patterns(files);
-
-        // Check all files and track if any are modified
-        // Important: We need to check ALL files, not return early,
-        // so that all files get recorded in the database
+        // Check all files and track if any are modified.
+        // Important: check ALL files, do not return early, so that every
+        // file gets recorded in the database.
         let mut any_modified = false;
-        for path in &expanded_paths {
-            let modified = self.is_file_modified(task_name, path).await?;
-            if modified {
+        for path in paths {
+            if self.is_file_modified(task_name, path).await? {
                 any_modified = true;
-                // Continue checking other files instead of returning early
             }
         }
-
         Ok(any_modified)
     }
 
-    /// Get current Unix timestamp
-    fn now() -> i64 {
-        time::system_time_to_unix_seconds(SystemTime::now())
+    /// Convenience wrapper: expand patterns and check whether any match
+    /// modified files. Walks the filesystem on every call. Prefer
+    /// [`find_files_matching_patterns`] + [`Self::check_paths_modified`]
+    /// when the expanded paths are needed elsewhere.
+    pub async fn check_modified_files(
+        &self,
+        task_name: &str,
+        patterns: &[String],
+    ) -> CacheResult<bool> {
+        if patterns.is_empty() {
+            return Ok(false);
+        }
+        let paths = find_files_matching_patterns(patterns);
+        self.check_paths_modified(task_name, &paths).await
+    }
+
+    /// Check if any previously tracked files for a task are no longer in the current set.
+    pub async fn has_removed_files(
+        &self,
+        task_name: &str,
+        current_paths: &[String],
+    ) -> CacheResult<bool> {
+        let db_paths: Vec<String> =
+            sqlx::query_scalar("SELECT path FROM watched_file WHERE task_name = ?")
+                .bind(task_name)
+                .fetch_all(self.pool())
+                .await?;
+
+        let current_set: HashSet<&str> = current_paths.iter().map(|s| s.as_str()).collect();
+        for db_path in &db_paths {
+            if !current_set.contains(db_path.as_str()) {
+                debug!(
+                    "Previously tracked file '{}' for task '{}' no longer matches glob patterns",
+                    db_path, task_name
+                );
+                return Ok(true);
+            }
+        }
+
+        Ok(false)
+    }
+
+    /// Remove watched_file entries for a task that are not in the current set of paths.
+    pub async fn cleanup_stale_files(
+        &self,
+        task_name: &str,
+        current_paths: &[String],
+    ) -> CacheResult<()> {
+        let db_paths: Vec<String> =
+            sqlx::query_scalar("SELECT path FROM watched_file WHERE task_name = ?")
+                .bind(task_name)
+                .fetch_all(self.pool())
+                .await?;
+
+        let current_set: HashSet<&str> = current_paths.iter().map(|s| s.as_str()).collect();
+        for db_path in &db_paths {
+            if !current_set.contains(db_path.as_str()) {
+                debug!(
+                    "Removing stale watched_file entry '{}' for task '{}'",
+                    db_path, task_name
+                );
+                sqlx::query("DELETE FROM watched_file WHERE task_name = ? AND path = ?")
+                    .bind(task_name)
+                    .bind(db_path)
+                    .execute(self.pool())
+                    .await?;
+            }
+        }
+
+        Ok(())
     }
 
     /// Store task output in the cache.
     pub async fn store_task_output(&self, task_name: &str, output: &Value) -> CacheResult<()> {
         let output_json = serde_json::to_string(output)?;
-        let now = Self::now();
+        let now = time::now_as_unix_seconds();
 
         sqlx::query(
             r#"
@@ -295,8 +584,8 @@ impl TaskCache {
             }
             Err(e) => {
                 warn!("Failed to check file {}: {}", path, e);
-                // File doesn't exist or is inaccessible, consider unchanged
-                Ok(false)
+                // File doesn't exist or is inaccessible, consider modified to force re-execution
+                Ok(true)
             }
         }
     }
@@ -805,5 +1094,264 @@ mod tests {
                 .await
                 .unwrap()
         );
+    }
+
+    #[test]
+    fn test_find_files_matching_patterns_with_negation() {
+        let temp_dir = TempDir::new().unwrap();
+        let base = temp_dir.path();
+
+        // Create directory structure:
+        // base/
+        //   src/
+        //     main.ts
+        //     util.ts
+        //   node_modules/
+        //     package/
+        //       index.ts
+        //   test.ts
+
+        let src_dir = base.join("src");
+        let node_modules_dir = base.join("node_modules");
+        let package_dir = node_modules_dir.join("package");
+
+        std::fs::create_dir_all(&src_dir).unwrap();
+        std::fs::create_dir_all(&package_dir).unwrap();
+
+        std::fs::write(src_dir.join("main.ts"), "main").unwrap();
+        std::fs::write(src_dir.join("util.ts"), "util").unwrap();
+        std::fs::write(package_dir.join("index.ts"), "index").unwrap();
+        std::fs::write(base.join("test.ts"), "test").unwrap();
+
+        // Test: all .ts files without negation
+        let pattern = format!("{}/**/*.ts", base.display());
+        let all_files = find_files_matching_patterns(&[pattern.clone()]);
+        assert_eq!(all_files.len(), 4); // main.ts, util.ts, index.ts, test.ts (via **)
+
+        // Test: exclude node_modules
+        let negation = "!**/node_modules/**".to_string();
+        let filtered = find_files_matching_patterns(&[pattern.clone(), negation]);
+        assert_eq!(filtered.len(), 3); // main.ts, util.ts, test.ts (excludes index.ts)
+        assert!(filtered.iter().all(|p| !p.contains("node_modules")));
+
+        // Test: multiple negation patterns
+        let negation1 = "!**/node_modules/**".to_string();
+        let negation2 = "!**/test.ts".to_string();
+        let filtered2 = find_files_matching_patterns(&[pattern.clone(), negation1, negation2]);
+        assert_eq!(filtered2.len(), 2); // main.ts, util.ts only
+        assert!(filtered2.iter().all(|p| !p.contains("node_modules")));
+        assert!(filtered2.iter().all(|p| !p.ends_with("test.ts")));
+    }
+
+    #[test]
+    fn test_find_files_matching_patterns_negation_only() {
+        // Test that negation-only patterns return empty (no positive patterns to match)
+        let result = find_files_matching_patterns(&["!**/node_modules/**".to_string()]);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_find_files_matching_patterns_empty() {
+        let result = find_files_matching_patterns(&[]);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_find_files_matching_patterns_preserves_depth_for_single_segment_patterns() {
+        let temp_dir = TempDir::new().unwrap();
+        let base = temp_dir.path();
+
+        let src_dir = base.join("src");
+        let src_sub_dir = src_dir.join("sub");
+        std::fs::create_dir_all(&src_sub_dir).unwrap();
+
+        std::fs::write(src_dir.join("foo.txt"), "root").unwrap();
+        std::fs::write(src_sub_dir.join("foo.txt"), "nested").unwrap();
+        std::fs::write(src_dir.join("a.ts"), "a").unwrap();
+        std::fs::write(src_sub_dir.join("b.ts"), "b").unwrap();
+
+        let foo_pattern = format!("{}/src/foo.txt", base.display());
+        let foo_matches = find_files_matching_patterns(&[foo_pattern]);
+        assert_eq!(foo_matches.len(), 1);
+        assert!(foo_matches[0].ends_with("/src/foo.txt"));
+
+        let ts_pattern = format!("{}/src/*.ts", base.display());
+        let ts_matches = find_files_matching_patterns(&[ts_pattern]);
+        assert_eq!(ts_matches.len(), 1);
+        assert!(ts_matches[0].ends_with("/src/a.ts"));
+    }
+
+    #[test]
+    fn test_find_files_matching_patterns_requires_explicit_dot_for_hidden_files() {
+        let temp_dir = TempDir::new().unwrap();
+        let base = temp_dir.path();
+
+        let src_dir = base.join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+
+        std::fs::write(src_dir.join("visible.ts"), "visible").unwrap();
+        std::fs::write(src_dir.join(".hidden.ts"), "hidden").unwrap();
+
+        let wildcard_pattern = format!("{}/src/*.ts", base.display());
+        let wildcard_matches = find_files_matching_patterns(&[wildcard_pattern]);
+        assert_eq!(wildcard_matches.len(), 1);
+        assert!(wildcard_matches[0].ends_with("/src/visible.ts"));
+
+        let explicit_dot_pattern = format!("{}/src/.*.ts", base.display());
+        let explicit_dot_matches = find_files_matching_patterns(&[explicit_dot_pattern]);
+        assert_eq!(explicit_dot_matches.len(), 1);
+        assert!(explicit_dot_matches[0].ends_with("/src/.hidden.ts"));
+    }
+
+    #[test]
+    fn test_find_files_matching_patterns_respects_gitignore() {
+        let temp_dir = TempDir::new().unwrap();
+        let base = temp_dir.path();
+
+        // Initialize a git repo so the ignore crate picks up .gitignore
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(base)
+            .output()
+            .unwrap();
+
+        // Create .gitignore that ignores repos/
+        std::fs::write(base.join(".gitignore"), "repos/\n").unwrap();
+
+        // Create directory structure:
+        // src/main.ts
+        // repos/deep/ignored.ts
+        let src_dir = base.join("src");
+        let repos_dir = base.join("repos").join("deep");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        std::fs::create_dir_all(&repos_dir).unwrap();
+
+        std::fs::write(src_dir.join("main.ts"), "main").unwrap();
+        std::fs::write(repos_dir.join("ignored.ts"), "ignored").unwrap();
+
+        let pattern = format!("{}/**/*.ts", base.display());
+        let matches = find_files_matching_patterns(&[pattern]);
+
+        // Should only find src/main.ts, not repos/deep/ignored.ts
+        assert_eq!(matches.len(), 1);
+        assert!(matches[0].ends_with("/src/main.ts"));
+    }
+
+    #[test]
+    fn test_extract_base_dir() {
+        // Pattern with base directory
+        assert_eq!(extract_base_dir("/foo/bar/**/*.ts"), Path::new("/foo/bar"));
+        assert_eq!(
+            extract_base_dir("/home/user/src/**/*.rs"),
+            Path::new("/home/user/src")
+        );
+
+        // Absolute patterns with top-level wildcard should keep root base dir
+        assert_eq!(extract_base_dir("/*.ts"), Path::new("/"));
+        assert_eq!(extract_base_dir("/nix*"), Path::new("/"));
+
+        // Pattern starting with glob
+        assert_eq!(extract_base_dir("**/*.ts"), Path::new("."));
+        assert_eq!(extract_base_dir("*.ts"), Path::new("."));
+        assert_eq!(extract_base_dir("src*/*.ts"), Path::new("."));
+        assert_eq!(extract_base_dir("foo?.nix"), Path::new("."));
+
+        // Pattern with no glob - returns directory part since no separator after the prefix
+        assert_eq!(extract_base_dir("/foo/bar/file.ts"), Path::new("/foo/bar"));
+
+        // Pattern with glob in middle
+        assert_eq!(extract_base_dir("/foo/*/bar/*.ts"), Path::new("/foo"));
+    }
+
+    #[sqlx::test]
+    async fn test_deleted_file_detected_as_modified() {
+        let db_temp_dir = TempDir::new().unwrap();
+        let db_path = db_temp_dir.path().join("tasks-del.db");
+        let cache = TaskCache::with_db_path(db_path).await.unwrap();
+
+        let test_temp_dir = TempDir::new().unwrap();
+        let file_a = test_temp_dir.path().join("a.ts");
+        let file_b = test_temp_dir.path().join("b.ts");
+        let file_c = test_temp_dir.path().join("c.ts");
+
+        std::fs::write(&file_a, "a").unwrap();
+        std::fs::write(&file_b, "b").unwrap();
+        std::fs::write(&file_c, "c").unwrap();
+
+        let task_name = "test_delete";
+        let pattern = format!("{}/*.ts", test_temp_dir.path().display());
+
+        // First run: all files are new
+        assert!(
+            cache
+                .check_modified_files(task_name, &[pattern.clone()])
+                .await
+                .unwrap()
+        );
+
+        // Store state for all files
+        for path in find_files_matching_patterns(&[pattern.clone()]) {
+            cache.update_file_state(task_name, &path).await.unwrap();
+        }
+
+        // Everything is up to date
+        assert!(
+            !cache
+                .check_modified_files(task_name, &[pattern.clone()])
+                .await
+                .unwrap()
+        );
+
+        // Delete c.ts
+        std::fs::remove_file(&file_c).unwrap();
+
+        // check_modified_files alone won't detect the deletion since c.ts
+        // is no longer in the glob expansion
+        assert!(
+            !cache
+                .check_modified_files(task_name, &[pattern.clone()])
+                .await
+                .unwrap()
+        );
+
+        // has_removed_files detects that a previously tracked file is gone
+        let current_paths = find_files_matching_patterns(&[pattern.clone()]);
+        assert!(
+            cache
+                .has_removed_files(task_name, &current_paths)
+                .await
+                .unwrap()
+        );
+    }
+
+    #[sqlx::test]
+    async fn test_inaccessible_file_treated_as_modified() {
+        let db_temp_dir = TempDir::new().unwrap();
+        let db_path = db_temp_dir.path().join("tasks-inacc.db");
+        let cache = TaskCache::with_db_path(db_path).await.unwrap();
+
+        let test_temp_dir = TempDir::new().unwrap();
+        let file_path = test_temp_dir.path().join("test.txt");
+        std::fs::write(&file_path, "content").unwrap();
+
+        let task_name = "test_inaccessible";
+        let path_str = file_path.to_str().unwrap().to_string();
+
+        // Store initial state
+        cache.update_file_state(task_name, &path_str).await.unwrap();
+
+        // File is unchanged
+        assert!(
+            !cache
+                .check_modified_files(task_name, &[path_str.clone()])
+                .await
+                .unwrap()
+        );
+
+        // Delete the file so TrackedFile::new will fail
+        std::fs::remove_file(&file_path).unwrap();
+
+        // is_file_modified should treat the error as modified, not unchanged
+        assert!(cache.is_file_modified(task_name, &path_str).await.unwrap());
     }
 }

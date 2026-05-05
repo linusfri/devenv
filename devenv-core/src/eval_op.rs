@@ -13,7 +13,7 @@ use std::sync::{Arc, LazyLock};
 /// A filesystem or environment operation observed during Nix evaluation.
 ///
 /// These operations are used for cache invalidation and dependency tracking.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum EvalOp {
     /// Copied a file to the Nix store.
     CopiedSource { source: PathBuf, target: PathBuf },
@@ -64,7 +64,7 @@ static GET_ENV: LazyLock<Regex> =
 static PATH_EXISTS: LazyLock<Regex> =
     LazyLock::new(|| Regex::new("^devenv pathExists: '(?P<source>.*)'$").expect("invalid regex"));
 static TRACKED_PATH: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new("^trace: devenv path: '(?P<source>.*)'$").expect("invalid regex"));
+    LazyLock::new(|| Regex::new("^devenv path: '(?P<source>.*)'$").expect("invalid regex"));
 
 impl EvalOp {
     /// Extract an `EvalOp` from an `InternalLog`.
@@ -122,22 +122,13 @@ pub trait OpObserver: Send + Sync + 'static {
     ///
     /// Implementations should be efficient as this is called synchronously
     /// from the log processing path.
-    fn on_op(&self, op: EvalOp);
-
-    /// Check if the observer is still active and accepting operations.
-    ///
-    /// Returns `false` to indicate the observer should be removed or skipped.
-    fn is_active(&self) -> bool;
+    fn record(&self, op: EvalOp);
 }
 
 /// Wrapper to allow `Arc<dyn OpObserver>` to implement `OpObserver`
 impl OpObserver for Arc<dyn OpObserver> {
-    fn on_op(&self, op: EvalOp) {
-        (**self).on_op(op);
-    }
-
-    fn is_active(&self) -> bool {
-        (**self).is_active()
+    fn record(&self, op: EvalOp) {
+        (**self).record(op);
     }
 }
 
@@ -241,7 +232,7 @@ mod tests {
 
     #[test]
     fn test_tracked_path() {
-        let log = create_log("trace: devenv path: '/path/to/file'");
+        let log = create_log("devenv path: '/path/to/file'");
         let op = EvalOp::from_internal_log(&log);
         assert_eq!(
             op,

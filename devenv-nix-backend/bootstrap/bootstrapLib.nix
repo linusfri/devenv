@@ -24,6 +24,7 @@ rec {
   mkDevenvForSystem =
     { version
     , is_development_version ? false
+    , require_version_match ? false
     , system
     , devenv_root
     , git_root ? null
@@ -31,16 +32,18 @@ rec {
     , devenv_dotfile_path
     , devenv_tmpdir
     , devenv_runtime
+    , devenv_state ? null
     , devenv_istesting ? false
     , devenv_direnvrc_latest_version
-    , container_name ? null
     , active_profiles ? [ ]
     , hostname
     , username
     , cli_options ? [ ]
     , skip_local_src ? false
     , secretspec ? null
-    , devenv_config ? { }
+    , devenv_inputs ? { }
+    , devenv_imports ? [ ]
+    , impure ? false
     , nixpkgs_config ? { }
     , lock_fingerprint ? null
     , primops ? { }
@@ -50,8 +53,7 @@ rec {
       lib = nixpkgs.lib;
       targetSystem = system;
 
-      # devenv configuration is passed from the Rust backend
-      overlays = lib.flatten (lib.mapAttrsToList getOverlays (devenv_config.inputs or { }));
+      overlays = lib.flatten (lib.mapAttrsToList getOverlays devenv_inputs);
 
       # Helper to create pkgs for a given system with nixpkgs_config
       mkPkgsForSystem =
@@ -59,6 +61,14 @@ rec {
         import nixpkgs {
           system = evalSystem;
           config = nixpkgs_config // {
+            # nixpkgs' check-meta.nix natively handles permittedInsecurePackages
+            # via allowInsecureDefaultPredicate using the full derivation name.
+            # We must NOT override allowInsecurePredicate here, as lib.getName
+            # strips the version, causing mismatches with user-provided entries
+            # like "openssl-1.1.1w".
+            #
+            # For unfree packages, nixpkgs does not natively support
+            # permittedUnfreePackages, so we provide a custom predicate.
             allowUnfreePredicate =
               if nixpkgs_config.allowUnfree or false then
                 (_: true)
@@ -66,6 +76,10 @@ rec {
                 (pkg: builtins.elem (lib.getName pkg) (nixpkgs_config.permittedUnfreePackages or [ ]))
               else
                 (_: false);
+          } // lib.optionalAttrs ((nixpkgs_config.allowlistedLicenses or [ ]) != [ ]) {
+            allowlistedLicenses = map (name: lib.licenses.${name}) (nixpkgs_config.allowlistedLicenses or [ ]);
+          } // lib.optionalAttrs ((nixpkgs_config.blocklistedLicenses or [ ]) != [ ]) {
+            blocklistedLicenses = map (name: lib.licenses.${name}) (nixpkgs_config.blocklistedLicenses or [ ]);
           };
           inherit overlays;
         };
@@ -150,6 +164,13 @@ rec {
                       cliVersion = version;
                     }
                 )
+                (lib.optionalAttrs
+                  (builtins.hasAttr "cli" options.devenv
+                  && builtins.hasAttr "requireVersionMatch" options.devenv.cli)
+                  {
+                    cli.requireVersionMatch = require_version_match;
+                  }
+                )
                 (lib.optionalAttrs (builtins.hasAttr "tmpdir" options.devenv) {
                   tmpdir = devenv_tmpdir;
                 })
@@ -158,6 +179,9 @@ rec {
                 })
                 (lib.optionalAttrs (builtins.hasAttr "runtime" options.devenv) {
                   runtime = devenv_runtime;
+                })
+                (lib.optionalAttrs (builtins.hasAttr "state" options.devenv && devenv_state != null) {
+                  state = lib.mkForce devenv_state;
                 })
                 (lib.optionalAttrs (builtins.hasAttr "direnvrcLatestVersion" options.devenv) {
                   direnvrcLatestVersion = devenv_direnvrc_latest_version;
@@ -175,15 +199,10 @@ rec {
               ];
             }
           )
-          (lib.optionalAttrs (container_name != null) {
-            container.isBuilding = lib.mkForce true;
-            containers.${container_name}.isBuilding = true;
-          })
         ]
-        ++ (lib.flatten (map importModule (devenv_config.imports or [ ])))
+        ++ (lib.flatten (map importModule devenv_imports))
         ++ (if !skip_local_src then (importModule (devenv_root + "/devenv.nix")) else [ ])
         ++ [
-          (devenv_config.devenv or { })
           (
             let
               localPath = devenv_root + "/devenv.local.nix";
@@ -389,6 +408,27 @@ rec {
 
       config = project.config;
 
+      # Per-container scoped re-evaluation that flips `isBuilding` for the
+      # container being built. Selecting one container cannot pollute the
+      # evaluation of any other operation, since each `containerBuilds.<name>`
+      # is its own `extendModules` scope.
+      mkContainerBuilds =
+        evalProject:
+        lib.genAttrs (lib.attrNames evalProject.config.containers) (
+          name:
+          let
+            scoped = evalProject.extendModules {
+              modules = [{
+                container.isBuilding = lib.mkForce true;
+                containers.${name}.isBuilding = lib.mkForce true;
+              }];
+            };
+          in
+          scoped.config.containers.${name}
+        );
+
+      containerBuilds = mkContainerBuilds project;
+
       # Apply config overlays to pkgs
       pkgs = pkgsBootstrap.appendOverlays (config.overlays or [ ]);
 
@@ -461,6 +501,7 @@ rec {
         in
         {
           config = evalProject.config;
+          containerBuilds = mkContainerBuilds evalProject;
         };
 
       # All supported systems for cross-compilation (lazily evaluated)
@@ -473,7 +514,11 @@ rec {
 
       # Generate perSystem entries for all systems (only evaluated when accessed)
       perSystemConfigs = lib.genAttrs allSystems (
-        perSystem: if perSystem == targetSystem then { config = config; } else evalForSystem perSystem
+        perSystem:
+        if perSystem == targetSystem then
+          { inherit config containerBuilds; }
+        else
+          evalForSystem perSystem
       );
     in
     {
@@ -491,7 +536,7 @@ rec {
       build = build project.options config;
       devenv = {
         # Backwards compatibility: wrap config in devenv attribute for code expecting devenv.config.*
-        config = config;
+        inherit config containerBuilds;
         # perSystem structure for cross-compilation (e.g. macOS building Linux containers)
         perSystem = perSystemConfigs;
       };

@@ -174,6 +174,10 @@ impl Default for RestartConfig {
     }
 }
 
+fn default_bash() -> String {
+    "bash".to_string()
+}
+
 fn default_period() -> u64 {
     10
 }
@@ -190,41 +194,37 @@ fn default_failure() -> u32 {
     3
 }
 
-/// Linux capability sets
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CapabilitySet {
-    Ambient,
-    Permitted,
-    Effective,
-    Inheritable,
-    Bounding,
-}
-
-/// Linux capabilities configuration
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct LinuxCapabilities {
-    /// Capabilities to add (e.g., "net_bind_service", "sys_ptrace")
-    #[serde(default)]
-    pub add: Vec<String>,
-    /// Which capability sets to apply (default: ambient)
-    #[serde(default)]
-    pub sets: Vec<CapabilitySet>,
-}
-
 /// Linux-specific process configuration
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct LinuxConfig {
-    /// Linux capabilities configuration
+    /// Linux capabilities to add as ambient (e.g., "net_bind_service", "sys_ptrace")
     #[serde(default)]
-    pub capabilities: LinuxCapabilities,
+    pub capabilities: Vec<String>,
+}
+
+/// Auto-start configuration for a process
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct StartConfig {
+    #[serde(default = "default_true")]
+    pub enable: bool,
+}
+
+impl Default for StartConfig {
+    fn default() -> Self {
+        Self { enable: true }
+    }
 }
 
 /// Process configuration
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ProcessConfig {
     #[serde(default)]
     pub name: String,
+    /// Path to the bash binary to use for exec probes
+    #[serde(default = "default_bash")]
+    pub bash: String,
+    #[serde(default)]
+    pub start: StartConfig,
     #[serde(default, rename = "type")]
     pub process_type: ProcessType,
     #[serde(default)]
@@ -254,4 +254,35 @@ pub struct ProcessConfig {
     /// Linux-specific configuration
     #[serde(default)]
     pub linux: LinuxConfig,
+}
+
+impl ProcessConfig {
+    /// Whether this config has any readiness mechanism (probe, TCP listen, or allocated ports).
+    pub fn has_readiness_probe(&self) -> bool {
+        self.ready.is_some()
+            || self.listen.iter().any(|spec| spec.kind == ListenKind::Tcp)
+            || !self.ports.is_empty()
+    }
+}
+
+impl Default for ProcessConfig {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            bash: "bash".to_string(),
+            start: StartConfig::default(),
+            process_type: ProcessType::default(),
+            exec: String::new(),
+            args: Vec::new(),
+            cwd: None,
+            env: HashMap::new(),
+            listen: Vec::new(),
+            ports: HashMap::new(),
+            ready: None,
+            restart: RestartConfig::default(),
+            watch: WatchConfig::default(),
+            watchdog: None,
+            linux: LinuxConfig::default(),
+        }
+    }
 }

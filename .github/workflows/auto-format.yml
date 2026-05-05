@@ -10,24 +10,25 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
 
       - uses: cachix/install-nix-action@v31
         with:
           extra_nix_config: |
             access-tokens = github.com=${{ secrets.GITHUB_TOKEN }}
 
-      - uses: cachix/cachix-action@v16
+      - uses: cachix/cachix-action@v17
         with:
           name: devenv
 
       - name: Install devenv
-        run: nix profile install github:cachix/devenv/latest -L --accept-flake-config
+        # TODO(sander): go back to latest once 2.0.3 is released
+        run: nix profile add github:cachix/devenv/v1.11.2 -L --accept-flake-config
 
       - name: Run formatters
         run: devenv shell -- prek run -a || true
 
-      - uses: EndBug/add-and-commit@v9
+      - uses: EndBug/add-and-commit@v10
         with:
           default_author: github_actions
           add: "."

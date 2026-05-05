@@ -20,12 +20,18 @@ boolean
 
 
 *Default:*
-` false `
+
+```nix
+false
+```
 
 
 
 *Example:*
-` true `
+
+```nix
+true
+```
 
 *Declared by:*
  - [https://github\.com/cachix/devenv/blob/main/src/modules/services/postgres\.nix](https://github.com/cachix/devenv/blob/main/src/modules/services/postgres.nix)
@@ -46,13 +52,16 @@ package
 
 
 *Default:*
-` pkgs.postgresql `
+
+```nix
+pkgs.postgresql
+```
 
 
 
 *Example:*
 
-```
+```nix
 pkgs.postgresql_15
 
 ```
@@ -74,7 +83,10 @@ boolean
 
 
 *Default:*
-` true `
+
+```nix
+true
+```
 
 *Declared by:*
  - [https://github\.com/cachix/devenv/blob/main/src/modules/services/postgres\.nix](https://github.com/cachix/devenv/blob/main/src/modules/services/postgres.nix)
@@ -124,6 +136,7 @@ The available extensions are:
  - pg_repack
  - pg_roaringbitmap
  - pg_safeupdate
+ - pg_search
  - pg_similarity
  - pg_squeeze
  - pg_tle
@@ -172,13 +185,16 @@ null or (function that evaluates to a(n) list of package)
 
 
 *Default:*
-` null `
+
+```nix
+null
+```
 
 
 
 *Example:*
 
-```
+```nix
 extensions: [
   extensions.pg_cron
   extensions.postgis
@@ -207,13 +223,16 @@ null or string
 
 
 *Default:*
-` null `
+
+```nix
+null
+```
 
 
 
 *Example:*
 
-```
+```nix
 builtins.readFile ./my-custom/directory/to/pg_hba.conf
 
 ```
@@ -239,7 +258,7 @@ list of strings concatenated with “\\n”
 
 *Default:*
 
-```
+```nix
 [
   "--locale=C"
   "--encoding=UTF8"
@@ -250,7 +269,7 @@ list of strings concatenated with “\\n”
 
 *Example:*
 
-```
+```nix
 [
   "--data-checksums"
   "--allow-group-access"
@@ -277,13 +296,16 @@ list of (submodule)
 
 
 *Default:*
-` [ ] `
+
+```nix
+[ ]
+```
 
 
 
 *Example:*
 
-```
+```nix
 [
   {
     name = "foodatabase";
@@ -314,13 +336,16 @@ null or string
 
 
 *Default:*
-` null `
+
+```nix
+null
+```
 
 
 
 *Example:*
 
-```
+```nix
 CREATE TABLE users (id SERIAL PRIMARY KEY, name TEXT);
 INSERT INTO users (name) VALUES ('admin');
 CREATE EXTENSION IF NOT EXISTS pg_uuidv7;
@@ -352,7 +377,7 @@ string
 
 
 
-Password of owner of the database (only takes effect if ` user ` is not ` null `)\.
+Password of the database owner role\. Requires ` user ` to be set\.
 
 
 
@@ -362,7 +387,10 @@ null or string
 
 
 *Default:*
-` null `
+
+```nix
+null
+```
 
 *Declared by:*
  - [https://github\.com/cachix/devenv/blob/main/src/modules/services/postgres\.nix](https://github.com/cachix/devenv/blob/main/src/modules/services/postgres.nix)
@@ -384,7 +412,10 @@ null or absolute path
 
 
 *Default:*
-` null `
+
+```nix
+null
+```
 
 *Declared by:*
  - [https://github\.com/cachix/devenv/blob/main/src/modules/services/postgres\.nix](https://github.com/cachix/devenv/blob/main/src/modules/services/postgres.nix)
@@ -395,7 +426,7 @@ null or absolute path
 
 
 
-Username of owner of the database (if null, the default $USER is used, only takes effect if ` pass ` is not ` null `)\.
+Username of owner of the database\. If set, a role with this name is created and the database is owned by it\. If null, the default $USER is used\.
 
 
 
@@ -405,7 +436,10 @@ null or string
 
 
 *Default:*
-` null `
+
+```nix
+null
+```
 
 *Declared by:*
  - [https://github\.com/cachix/devenv/blob/main/src/modules/services/postgres\.nix](https://github.com/cachix/devenv/blob/main/src/modules/services/postgres.nix)
@@ -431,13 +465,16 @@ null or string
 
 
 *Default:*
-` null `
+
+```nix
+null
+```
 
 
 
 *Example:*
 
-```
+```nix
 CREATE ROLE postgres SUPERUSER;
 CREATE ROLE bar;
 
@@ -474,12 +511,18 @@ string
 
 
 *Default:*
-` "" `
+
+```nix
+""
+```
 
 
 
 *Example:*
-` "127.0.0.1" `
+
+```nix
+"127.0.0.1"
+```
 
 *Declared by:*
  - [https://github\.com/cachix/devenv/blob/main/src/modules/services/postgres\.nix](https://github.com/cachix/devenv/blob/main/src/modules/services/postgres.nix)
@@ -500,7 +543,10 @@ The TCP port to accept connections\.
 
 
 *Default:*
-` 5432 `
+
+```nix
+5432
+```
 
 *Declared by:*
  - [https://github\.com/cachix/devenv/blob/main/src/modules/services/postgres\.nix](https://github.com/cachix/devenv/blob/main/src/modules/services/postgres.nix)
@@ -526,13 +572,16 @@ attribute set of (boolean or floating point number or signed integer or string)
 
 
 *Default:*
-` { } `
+
+```nix
+{ }
+```
 
 
 
 *Example:*
 
-```
+```nix
 {
   log_connections = true;
   log_statement = "all";

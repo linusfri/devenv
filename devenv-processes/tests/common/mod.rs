@@ -20,9 +20,13 @@ pub struct TestContext {
 
 impl TestContext {
     pub fn new() -> Self {
-        let temp_dir = TempDir::new().expect("Failed to create temp dir");
-        let state_dir = temp_dir.path().join("state");
-        std::fs::create_dir_all(&state_dir).expect("Failed to create state dir");
+        // Short prefix and no subdirectory to keep Unix socket paths under
+        // SUN_LEN (108). Nix build sandboxes set TMPDIR to ~64 char paths.
+        let temp_dir = tempfile::Builder::new()
+            .prefix("t")
+            .tempdir()
+            .expect("Failed to create temp dir");
+        let state_dir = temp_dir.path().to_path_buf();
         Self {
             temp_dir,
             state_dir,
@@ -355,6 +359,25 @@ pub async fn wait_for_watcher_ready(
         let poll_time = Duration::from_millis(500).min(remaining);
         let count = wait_for_line_count(counter_file, pattern, current_count + 1, poll_time).await;
         if count > current_count {
+            // On macOS, FSEvents can deliver delayed/coalesced events from the
+            // probe writes. Wait until the restart count stabilizes (no change
+            // for 1 s) so that subsequent assertions start from a clean baseline.
+            #[cfg(target_os = "macos")]
+            {
+                let mut stable = count;
+                loop {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    let now =
+                        wait_for_line_count(counter_file, pattern, 1, Duration::from_millis(100))
+                            .await;
+                    if now == stable {
+                        break;
+                    }
+                    stable = now;
+                }
+                return stable;
+            }
+            #[cfg(not(target_os = "macos"))]
             return count;
         }
     }

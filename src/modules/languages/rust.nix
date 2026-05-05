@@ -81,12 +81,72 @@ in
       '';
     };
 
+    lld.enable = lib.mkOption {
+      type = lib.types.bool;
+      default = false;
+      description = ''
+        Use [lld](https://lld.llvm.org/) as the linker.
+
+        lld is LLVM's linker and is the recommended fast linker for Darwin.
+        Works on both Linux and macOS.
+      '';
+    };
+
+    wild.enable = lib.mkOption {
+      type = lib.types.bool;
+      default = false;
+      description = ''
+        Use [wild](https://github.com/wild-linker/wild) as the linker.
+
+        wild is a very fast linker for Linux.
+      '';
+    };
+
+    cranelift = {
+      enable = lib.mkOption {
+        type = lib.types.bool;
+        default = false;
+        description = ''
+          Use [Cranelift](https://cranelift.dev/) as the codegen backend for dev builds.
+
+          Cranelift compiles significantly faster than LLVM at the cost of less optimized output.
+          Requires the nightly channel.
+        '';
+      };
+
+      forceBuildScriptsLlvm = lib.mkOption {
+        type = lib.types.bool;
+        default = false;
+        description = ''
+          Force build scripts and proc macros to use the LLVM backend.
+
+          Some build scripts may not work with Cranelift. Enable this to fall back to
+          LLVM for build scripts while keeping Cranelift for regular code.
+        '';
+      };
+
+      excludePackages = lib.mkOption {
+        type = lib.types.listOf lib.types.str;
+        default = [ ];
+        description = ''
+          List of crate names that should use the LLVM backend instead of Cranelift.
+
+          Generates per-package overrides in `.cargo/config.toml`.
+        '';
+        example = [ "aws-lc-sys" "aws-lc-rs" "rustls" ];
+      };
+    };
+
     lsp = {
       enable = lib.mkEnableOption "Rust Language Server" // { default = true; };
       package = lib.mkOption {
         type = lib.types.package;
-        default = pkgs.rust-analyzer;
-        defaultText = lib.literalExpression "pkgs.rust-analyzer";
+        defaultText = lib.literalMD ''
+          Depends on the configured toolchain:
+          - `nixpkgs` channel: `pkgs.rust-analyzer`.
+          - non-nixpkgs channel: the `rust-analyzer` component from the rust-overlay toolchain, with a fallback to `pkgs.rust-analyzer` if not present in the manifest.
+          - `toolchainFile`: the aggregated toolchain package derived from the file.
+        '';
         description = "The Rust language server package to use.";
       };
     };
@@ -165,6 +225,17 @@ in
 
   config = lib.mkIf cfg.enable (lib.mkMerge [
     {
+      changelogs = [
+        {
+          date = "2026-03-08";
+          title = "`languages.rust.import` now uses your configured toolchain";
+          when = cfg.enable;
+          description = ''
+            Previously, `languages.rust.import` would use the default, stable version of Rust from nixpkgs to build packages. Now, `languages.rust.import` uses the toolchain configured with your development environment (`languages.rust.toolchainPackage`).
+          '';
+        }
+      ];
+
       languages.rust.import = path: args:
         let
           crate2nixTools = pkgs.callPackage "${crate2nix}/tools.nix" { };
@@ -181,16 +252,52 @@ in
           );
 
           # Use crate2nix IFD to auto-generate
-          cargoNix = crate2nixTools.appliedCargoNix {
-            name = packageName;
-            src = path;
-          };
+          cargoNix =
+            let
+              toolchain = cfg.toolchainPackage;
+            in
+            pkgs.callPackage
+              (crate2nixTools.generatedCargoNix {
+                name = packageName;
+                src = path;
+              })
+              {
+                buildRustCrateForPkgs =
+                  _:
+                  pkgs.buildRustCrate.override {
+                    rustc = toolchain;
+                    cargo = toolchain;
+                  };
+              };
         in
         cargoNix.rootCrate.build.override args;
     }
     (
       {
         assertions = [
+          {
+            assertion = cfg.cranelift.enable -> cfg.channel == "nightly";
+            message = ''
+              `languages.rust.cranelift.enable` requires `languages.rust.channel = "nightly"`.
+
+              Cranelift is an unstable codegen backend that is only available on the nightly channel.
+            '';
+          }
+          {
+            assertion = lib.count lib.id [ cfg.mold.enable cfg.lld.enable cfg.wild.enable ] <= 1;
+            message = ''
+              Only one linker can be enabled at a time.
+
+              You have enabled multiple linkers among mold, lld, and wild.
+              Please enable at most one.
+            '';
+          }
+          {
+            assertion = cfg.wild.enable -> pkgs.stdenv.isLinux;
+            message = ''
+              `languages.rust.wild.enable` is only supported on Linux.
+            '';
+          }
           {
             assertion = cfg.channel == "nixpkgs" -> (cfg.targets == [ ]);
             message = ''
@@ -251,6 +358,8 @@ in
 
         packages =
           lib.optional cfg.mold.enable pkgs.mold-wrapped
+          ++ lib.optional cfg.lld.enable pkgs.llvmPackages.bintools
+          ++ lib.optional cfg.wild.enable pkgs.wild
           ++ lib.optional pkgs.stdenv.isDarwin pkgs.libiconv
           ++ lib.optional cfg.lsp.enable cfg.lsp.package;
 
@@ -260,6 +369,17 @@ in
         env =
           let
             moldFlags = lib.optionalString cfg.mold.enable "-C link-arg=-fuse-ld=mold";
+            lldFlags = lib.optionalString cfg.lld.enable "-C link-arg=-fuse-ld=lld";
+            # TODO: Work around rustc's default lld selection and missing native GCC Wild support;
+            # use `-C linker-features=-lld -C link-arg=-B${pkgs.wild}/bin` for now, then switch to
+            # `-C link-arg=-fuse-ld=wild` once a released GCC supports it.
+            # `-C linker-features` is stable on x86_64-linux but gated behind `-Z unstable-options`
+            # on aarch64-linux, so add the flag there (requires nightly on that target).
+            wildFlags = lib.optionalString cfg.wild.enable (
+              "-C linker-features=-lld -C link-arg=-B${pkgs.wild}/bin"
+              + lib.optionalString pkgs.stdenv.isAarch64 " -Z unstable-options"
+            );
+            linkerFlags = lib.concatStringsSep " " (lib.filter (x: x != "") [ moldFlags lldFlags wildFlags ]);
             optionalEnv = cond: str: if cond then str else null;
           in
           {
@@ -269,8 +389,12 @@ in
               if cfg.toolchain ? rust-src
               then "${cfg.toolchain.rust-src}/lib/rustlib/src/rust/library"
               else pkgs.rustPlatform.rustLibSrc;
-            RUSTFLAGS = optionalEnv (moldFlags != "" || cfg.rustflags != "") (lib.concatStringsSep " " (lib.filter (x: x != "") [ moldFlags cfg.rustflags ]));
-            RUSTDOCFLAGS = optionalEnv (moldFlags != "") moldFlags;
+
+            CARGO_UNSTABLE_CODEGEN_BACKEND = optionalEnv cfg.cranelift.enable "true";
+            CARGO_PROFILE_DEV_CODEGEN_BACKEND = optionalEnv cfg.cranelift.enable "cranelift";
+            CARGO_PROFILE_DEV_BUILD_OVERRIDE_CODEGEN_BACKEND = optionalEnv cfg.cranelift.forceBuildScriptsLlvm "llvm";
+            RUSTFLAGS = optionalEnv (linkerFlags != "" || cfg.rustflags != "") (lib.concatStringsSep " " (lib.filter (x: x != "") [ linkerFlags cfg.rustflags ]));
+            RUSTDOCFLAGS = optionalEnv (linkerFlags != "") linkerFlags;
           };
 
         git-hooks.tools = {
@@ -281,8 +405,21 @@ in
 
         # Allow clippy to access the internet to fetch dependencies.
         git-hooks.hooks.clippy.settings.offline = lib.mkDefault false;
+
+        languages.rust.components = lib.mkIf cfg.cranelift.enable (lib.mkAfter [ "rustc-codegen-cranelift-preview" ]);
       }
     )
+
+    (lib.mkIf (cfg.cranelift.excludePackages != [ ]) {
+      files.".cargo/config.toml".toml = {
+        profile.dev.package = lib.listToAttrs (map
+          (pkg: {
+            name = pkg;
+            value = { codegen-backend = "llvm"; };
+          })
+          cfg.cranelift.excludePackages);
+      };
+    })
 
     (lib.mkIf (cfg.toolchainFile != null) (
       let
@@ -291,6 +428,7 @@ in
       in
       {
         languages.rust.toolchainPackage = toolchainFromFile;
+        languages.rust.lsp.package = lib.mkDefault toolchainFromFile;
         packages = [ cfg.toolchainPackage ];
       }
     ))
@@ -302,6 +440,7 @@ in
           paths = builtins.map (c: cfg.toolchain.${c} or (throw "toolchain.${c}")) cfg.components;
         }
       );
+      languages.rust.lsp.package = lib.mkDefault cfg.toolchain.rust-analyzer;
       packages = [ cfg.toolchainPackage ];
     })
 
@@ -312,11 +451,17 @@ in
         # WARNING: private API
         # Import the mkAggregated function.
         # This symlinkJoins and patches the individual components.
-        mkAggregated = import (rust-overlay + "/lib/mk-aggregated.nix") {
+        mkAggregatedFn = import (rust-overlay + "/lib/mk-aggregated.nix");
+        mkAggregatedArgs = builtins.functionArgs mkAggregatedFn;
+        mkAggregated = mkAggregatedFn ({
           inherit (pkgs) lib stdenv symlinkJoin bash curl;
           inherit (pkgs.buildPackages) rustc;
           pkgsTargetTarget = pkgs.targetPackages;
-        };
+        } // lib.optionalAttrs (mkAggregatedArgs ? makeWrapper) {
+          inherit (pkgs) makeWrapper;
+        } // lib.optionalAttrs (mkAggregatedArgs ? pkgsHostHost) {
+          inherit (pkgs) pkgsHostHost;
+        });
 
         # Get the toolchain for component resolution with error handling
         channel = rustBin.${cfg.channel} or (throw "Invalid Rust channel '${cfg.channel}'. Available: ${lib.concatStringsSep ", " (lib.filter (c: c != "nixpkgs") validChannels)}");
@@ -378,6 +523,11 @@ in
       {
         languages.rust.toolchain = builtins.mapAttrs (_: lib.mkDefault) toolchainComponents;
         languages.rust.toolchainPackage = lib.mkDefault profile;
+        languages.rust.lsp.package = lib.mkDefault (
+          if builtins.elem "rust-analyzer" availableComponents then toolchainComponents.rust-analyzer
+          else if builtins.elem "rust-analyzer-preview" availableComponents then toolchainComponents.rust-analyzer-preview
+          else builtins.trace "warning: rust-analyzer not found in the ${cfg.channel} toolchain components; falling back to pkgs.rust-analyzer" pkgs.rust-analyzer
+        );
         packages = [ cfg.toolchainPackage ];
       }
     ))

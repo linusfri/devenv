@@ -191,6 +191,15 @@ impl Shutdown {
         }
     }
 
+    /// Trigger shutdown and wait for cleanup to finish. Idempotent: safe
+    /// to call multiple times — the second call is a no-op (the
+    /// cancellation token is already cancelled and the cleanup receiver
+    /// has been consumed).
+    pub async fn shutdown_and_wait(&self) {
+        self.shutdown();
+        self.wait_for_shutdown_complete().await;
+    }
+
     /// Check if shutdown has been triggered
     pub fn is_cancelled(&self) -> bool {
         self.token.is_cancelled()
@@ -218,6 +227,18 @@ impl Shutdown {
         }
     }
 
+    /// Handle a user initiated interrupt (e.g., Ctrl+C from keyboard).
+    ///
+    /// On first call: records SIGINT and triggers graceful shutdown.
+    /// On second call (already shutting down): force exits the process.
+    pub fn handle_interrupt(&self) {
+        if self.is_cancelled() {
+            self.exit_process();
+        }
+        self.set_last_signal(Signal::SIGINT);
+        self.shutdown();
+    }
+
     /// Set the last signal manually.
     ///
     /// Used in TUI mode where Ctrl+C is received as a keyboard event rather than
@@ -230,10 +251,10 @@ impl Shutdown {
     /// to terminate with the correct exit code.
     pub fn exit_process(&self) -> ! {
         // Run pre-exit hook (e.g., restore terminal state) before killing the process
-        if let Ok(guard) = self.pre_exit_hook.lock() {
-            if let Some(hook) = guard.as_ref() {
-                hook();
-            }
+        if let Ok(guard) = self.pre_exit_hook.lock()
+            && let Some(hook) = guard.as_ref()
+        {
+            hook();
         }
 
         let signal = self.last_signal().unwrap_or(Signal::SIGTERM);
@@ -325,13 +346,27 @@ where
         self.join_set.join_next().await
     }
 
-    /// Wait for all tasks to complete, propagating panics
+    /// Wait for all tasks to complete, propagating panics.
+    /// If shutdown is triggered, abort remaining tasks and return.
     pub async fn wait_all(&mut self) {
-        while let Some(res) = self.join_next().await {
-            match res {
-                Ok(_) => {}
-                Err(err) if err.is_panic() => std::panic::resume_unwind(err.into_panic()),
-                Err(err) => panic!("{err}"),
+        let cancel = self.shutdown.cancellation_token();
+        loop {
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => {
+                    self.join_set.abort_all();
+                    // Drain remaining tasks so they're fully cleaned up
+                    while self.join_set.join_next().await.is_some() {}
+                    break;
+                }
+                result = self.join_set.join_next() => {
+                    match result {
+                        Some(Ok(_)) => {}
+                        Some(Err(err)) if err.is_panic() => std::panic::resume_unwind(err.into_panic()),
+                        Some(Err(err)) => panic!("{err}"),
+                        None => break,
+                    }
+                }
             }
         }
     }

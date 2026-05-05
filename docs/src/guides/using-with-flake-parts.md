@@ -23,8 +23,9 @@ Here's an example of a minimal `flake.nix` file that includes `devenv`:
 ```nix
 {
   inputs = {
-    nixpkgs.url = "github:cachix/devenv-nixpkgs/rolling";
+    flake-parts.url = "github:hercules-ci/flake-parts";
     devenv.url = "github:cachix/devenv";
+    nixpkgs.url = "github:cachix/devenv-nixpkgs/rolling";
   };
 
   outputs = inputs@{ flake-parts, nixpkgs, ... }:
@@ -165,23 +166,30 @@ in {
 }
 ```
 
-### Automated shell switching
+### Automated shell switching with direnv
 
-You can configure your shell to launch automatically when you enter the project directory.
+Activate your shell automatically when you enter the project directory.
 
-First, install [nix-direnv](https://github.com/nix-community/nix-direnv).
+1. Install [nix-direnv](https://github.com/nix-community/nix-direnv).
 
-Then add the following line to your `.envrc`:
+2. Download the [`.envrc` from the flake-parts template](https://github.com/cachix/devenv/blob/main/templates/flake-parts/.envrc):
 
-```text
-use flake . --no-pure-eval
-```
+    ```console
+    curl -o .envrc https://raw.githubusercontent.com/cachix/devenv/main/templates/flake-parts/.envrc
+    ```
 
-Allow `direnv` to evaluate the updated `.envrc`:
+3. Allow direnv to evaluate it:
 
-```console
-direnv allow
-```
+    ```console
+    direnv allow
+    ```
+
+#### Caching `devenv up` with direnv
+
+By default, `devenv up` re-evaluates the flake before starting processes to pick up any changes.
+With direnv, the shell is reloaded automatically whenever the flake changes, keeping the environment up to date.
+
+The template `.envrc` sets `DEVENV_IN_DIRENV_SHELL=true` to take advantage of this: `devenv up` skips re-evaluation and uses the cached environment directly, starting significantly faster.
 
 ## Multiple shells
 

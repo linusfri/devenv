@@ -32,12 +32,27 @@ let
     };
   });
 
+  parseProcessDep = import ./lib/parse-process-dep.nix { inherit lib; };
+
   processType = types.submodule ({ config, name, ... }: {
     options = {
-      enable = lib.mkOption {
-        type = types.bool;
-        default = true;
-        description = "Whether to start this process automatically with `devenv up`.";
+      start = lib.mkOption {
+        type = types.submodule {
+          options = {
+            enable = lib.mkOption {
+              type = types.bool;
+              default = true;
+              description = ''
+                Whether to start this process automatically with `devenv up`.
+
+                Disabled processes are still visible in the TUI as stopped
+                and can be started manually by selecting them and pressing Enter.
+              '';
+            };
+          };
+        };
+        default = { };
+        description = "Auto-start configuration for this process.";
       };
 
       exec = lib.mkOption {
@@ -170,9 +185,10 @@ let
         description = ''
           Tasks that must be ready before this process starts.
           Use task names like "devenv:processes:postgres" or "myapp:setup".
-          Supports @ready (default) and @complete suffixes.
+          Supports @started, @ready (default for processes), and @completed suffixes for process dependencies.
+          Supports @started, @succeeded (default for tasks), and @completed suffixes for task dependencies.
         '';
-        example = [ "devenv:processes:postgres" "myapp:migrations@complete" ];
+        example = [ "devenv:processes:postgres" "myapp:migrations@succeeded" ];
       };
 
       before = lib.mkOption {
@@ -205,6 +221,30 @@ let
           depends_on.some-other-process.condition =
             "process_completed_successfully";
         };
+      };
+
+      linux = lib.mkOption {
+        type = types.submodule {
+          options = {
+            capabilities = lib.mkOption {
+              type = types.listOf types.str;
+              default = [ ];
+              description = ''
+                Linux capabilities to add as ambient capabilities for this process
+                (e.g., "cap_net_admin", "cap_sys_admin").
+
+                Requires devenv 2.0+.
+              '';
+              example = [ "cap_net_admin" "cap_sys_admin" ];
+            };
+          };
+        };
+        default = { };
+        description = ''
+          Linux-specific process configuration.
+
+          Requires devenv 2.0+.
+        '';
       };
 
       watch = lib.mkOption {
@@ -263,6 +303,19 @@ let
         '';
       };
 
+    };
+
+    config = lib.mkIf (implementation == "process-compose") {
+      process-compose.depends_on =
+        let
+          deps = lib.filter (x: x != null) (map parseProcessDep config.after);
+        in
+        lib.listToAttrs (map
+          (dep: {
+            name = dep.name;
+            value.condition = dep.pcCondition;
+          })
+          deps);
     };
   });
 
@@ -362,12 +415,6 @@ in
       description = "The command to run each process through devenv-tasks with exec prefix for proper signal handling.";
     };
 
-    process.nativeConfigJson = lib.mkOption {
-      type = types.package;
-      internal = true;
-      default = pkgs.writeText "process-config.json" (builtins.toJSON { });
-      description = "JSON configuration for native process manager";
-    };
   };
 
   config = lib.mkMerge [
@@ -381,30 +428,46 @@ in
     #
     # Infinite recursion, oh my!
     {
-      assertions = [{
-        assertion =
-          let
-            enabledImplementations =
-              lib.pipe supportedImplementations [
-                (map (name: config.process.managers.${name}.enable))
-                (lib.filter lib.id)
-              ];
-          in
-          lib.length enabledImplementations == 1;
-        message = ''
-          Only a single process manager can be enabled at a time.
-        '';
-      }];
+      assertions = [
+        {
+          assertion =
+            let
+              enabledImplementations =
+                lib.pipe supportedImplementations [
+                  (map (name: config.process.managers.${name}.enable))
+                  (lib.filter lib.id)
+                ];
+            in
+            lib.length enabledImplementations == 1;
+          message = ''
+            Only a single process manager can be enabled at a time.
+          '';
+        }
+        {
+          assertion = implementation != "native" || config.process.manager.before == "";
+          message = ''
+            process.manager.before is not supported with the native process manager.
+            Use tasks with process dependencies instead. See https://devenv.sh/tasks/
+          '';
+        }
+        {
+          assertion = implementation != "native" || config.process.manager.after == "";
+          message = ''
+            process.manager.after is not supported with the native process manager.
+            Use tasks with process dependencies instead. See https://devenv.sh/tasks/
+          '';
+        }
+      ];
 
       process.managers.${implementation}.enable = lib.mkDefault true;
     }
 
     (lib.mkIf options.processes.isDefined (
       let
-        enabledProcesses = lib.filterAttrs (_: p: p.enable) config.processes;
+        enabledProcesses = lib.filterAttrs (_: p: p.start.enable) config.processes;
       in
       {
-        # Create tasks only for enabled processes (native manager discovers process tasks from this)
+        # Create tasks for all processes (native manager uses enable flag to decide auto-start)
         tasks = lib.mapAttrs'
           (name: process: {
             name = "devenv:processes:${name}";
@@ -415,24 +478,32 @@ in
               cwd = process.cwd;
               after = process.after;
               before = process.before;
-              # Always show output for process tasks so process-compose can capture it
               showOutput = true;
-              # Process-specific configuration
-              ready = process.ready;
-              restart = process.restart;
-              listen = process.listen;
-              ports = lib.mapAttrs (_: portCfg: portCfg.value) process.ports;
-              watch = process.watch;
-              watchdog = process.watchdog;
+              process = {
+                start.enable = process.start.enable;
+                ready = process.ready;
+                restart = process.restart;
+                listen = process.listen;
+                ports = lib.mapAttrs (_: portCfg: portCfg.value) process.ports;
+                watch = process.watch // {
+                  paths = map toString process.watch.paths;
+                };
+                watchdog = process.watchdog;
+              };
             };
           })
-          enabledProcesses;
+          config.processes;
 
-        # Provide the devenv-tasks command for each enabled process so process managers can use it
-        # to support before/after task dependencies
-        process.taskCommandsBase = lib.mapAttrs
-          (name: _: "${config.task.package}/bin/devenv-tasks run --task-file ${config.task.config} --mode all --cache-dir ${lib.escapeShellArg config.devenv.dotfile} --runtime-dir ${lib.escapeShellArg config.devenv.runtime} devenv:processes:${name}")
-          enabledProcesses;
+        # Provide the devenv-tasks command for each enabled process so non-native process managers
+        # (process-compose, mprocs) can use it to run before/after task dependencies.
+        # Not used by the native manager (devenv 2.0+) which handles process tasks directly.
+        process.taskCommandsBase =
+          let
+            ignoreProcessDepsFlag = lib.optionalString (implementation != "native") " --ignore-process-deps";
+          in
+          lib.mapAttrs
+            (name: _: "${config.task.package}/bin/devenv-tasks run --task-file ${config.task.config} --mode all --cache-dir ${lib.escapeShellArg config.devenv.dotfile} --runtime-dir ${lib.escapeShellArg config.devenv.runtime}${ignoreProcessDepsFlag} devenv:processes:${name}")
+            enabledProcesses;
 
         # With exec prefix for proper signal handling (derived from base)
         process.taskCommands = lib.mapAttrs

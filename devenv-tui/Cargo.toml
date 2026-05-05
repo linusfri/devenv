@@ -15,75 +15,58 @@ tokio = { workspace = true, features = [
   "time",
   "signal",
 ] }
-tokio-shutdown = { workspace = true }
-futures = { workspace = true }
-async-trait = { workspace = true }
+tokio-shutdown.workspace = true
 
 # TUI library
 iocraft.workspace = true
-crossterm = { workspace = true }
+crossterm.workspace = true
 
 # Tracing integration
-tracing = { workspace = true }
-tracing-subscriber = { workspace = true }
-
-# Data structures
-indexmap = { workspace = true }
+tracing.workspace = true
+tracing-subscriber.workspace = true
 
 # Terminal state management
-libc = "0.2"
+libc.workspace = true
 
 # Error handling
-thiserror = { workspace = true }
-anyhow = { workspace = true }
-miette = { workspace = true }
+thiserror.workspace = true
+anyhow.workspace = true
 
 # CLI argument parsing
-clap = { workspace = true }
+clap.workspace = true
 
 # Serialization
-serde = { workspace = true }
-serde_json = { workspace = true }
-
-# Nix log parsing
-devenv-eval-cache = { path = "../devenv-eval-cache" }
+serde.workspace = true
+serde_json.workspace = true
 
 # Activity system
-devenv-activity = { path = "../devenv-activity" }
+devenv-activity.workspace = true
 
 # Process control
-devenv-processes = { path = "../devenv-processes" }
+devenv-processes.workspace = true
 
 # Shell session management (provides ShellSession, protocol types)
-devenv-shell = { path = "../devenv-shell" }
-
-# Shared task types
-devenv-cache-core = { path = "../devenv-cache-core" }
+devenv-shell.workspace = true
 
 # Time handling
-once_cell = { workspace = true }
-chrono = { workspace = true }
+chrono.workspace = true
 
 # Human-readable formatting
-human-repr = { workspace = true }
+human-repr.workspace = true
 
 # URL parsing
-url = { workspace = true }
-
-# Random number generation
-rand = { workspace = true }
-
-# Regex for ANSI stripping
-regex = { workspace = true }
-
-# Terminal UI components
-console = { workspace = true }
+url.workspace = true
 
 # Base64 encoding (for OSC 52 clipboard)
-base64 = { workspace = true }
+base64.workspace = true
 [[bin]]
 name = "tui-replay"
 path = "src/bin/tui-replay.rs"
 
 [dev-dependencies]
-insta = { workspace = true }
+insta.workspace = true
+
+[features]
+default = []
+deterministic-tui = []
+test-all = ["deterministic-tui"]

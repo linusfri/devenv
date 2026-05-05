@@ -29,12 +29,17 @@ on:
         required: false
         type: string
 
+      only:
+        description: "Only run specific tests (passed to --only flag)"
+        required: false
+        type: string
+
 jobs:
   tests:
     runs-on: ${{ fromJSON(inputs.runs-on) }}
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
         with:
           repository: ${{ inputs.repository }}
           ref: ${{ inputs.ref }}
@@ -46,7 +51,7 @@ jobs:
             access-tokens = github.com=${{ secrets.GITHUB_TOKEN }}
 
       - name: Configure Cachix
-        uses: cachix/cachix-action@v16
+        uses: cachix/cachix-action@v17
         with:
           name: devenv
           authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
@@ -71,7 +76,14 @@ jobs:
         run: devenv ${{ steps.override-args.outputs.args }} test
 
       - name: Run tests
-        run: devenv-run-tests run tests ${{ steps.override-args.outputs.args }}
+        env:
+          ONLY: ${{ inputs.only }}
+        run: |
+          args=()
+          if [ -n "$ONLY" ]; then
+            args+=(--only "$ONLY")
+          fi
+          devenv-run-tests run tests ${{ steps.override-args.outputs.args }} "${args[@]}"
 
 
   direnv:
@@ -79,7 +91,7 @@ jobs:
     runs-on: ${{ fromJSON(inputs.runs-on) }}
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
         with:
           repository: ${{ inputs.repository }}
           ref: ${{ inputs.ref }}
@@ -90,7 +102,7 @@ jobs:
           nix_path: nixpkgs=channel:nixos-unstable
 
       - name: Configure Cachix
-        uses: cachix/cachix-action@v16
+        uses: cachix/cachix-action@v17
         with:
           name: devenv
           authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
@@ -125,7 +137,7 @@ jobs:
     runs-on: ${{ fromJSON(inputs.runs-on) }}
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
         with:
           repository: ${{ inputs.repository }}
           ref: ${{ inputs.ref }}
@@ -136,7 +148,7 @@ jobs:
           nix_path: nixpkgs=channel:nixos-unstable
 
       - name: Configure Cachix
-        uses: cachix/cachix-action@v16
+        uses: cachix/cachix-action@v17
         with:
           name: devenv
           authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}

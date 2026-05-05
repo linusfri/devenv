@@ -1,5 +1,9 @@
 use clap::Parser;
-use devenv::{Config, Devenv, DevenvOptions, tracing as devenv_tracing};
+use devenv::{
+    Config, Devenv, DevenvOptions, NixSettings, SecretOptions, SecretSettings,
+    tracing as devenv_tracing,
+};
+use globset::{Glob, GlobSet, GlobSetBuilder};
 use miette::{IntoDiagnostic, Result, WrapErr};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -36,20 +40,28 @@ enum Commands {
 
 #[derive(Parser, Debug)]
 struct RunArgs {
-    #[clap(long, value_parser, help = "Exclude these tests.")]
-    exclude: Vec<PathBuf>,
+    #[clap(
+        long,
+        value_parser,
+        help = "Exclude tests matching these glob patterns (e.g. 'python-*')."
+    )]
+    exclude: Vec<String>,
 
-    #[clap(long, value_parser, help = "Only run these tests.")]
-    only: Vec<PathBuf>,
+    #[clap(
+        long,
+        value_parser,
+        help = "Only run tests matching these glob patterns (e.g. 'python-*')."
+    )]
+    only: Vec<String>,
 
     #[clap(
         short,
-        long,
+        long = "override-input",
         number_of_values = 2,
         value_delimiter = ' ',
         help = "Override inputs in devenv.yaml."
     )]
-    override_input: Vec<String>,
+    override_inputs: Vec<String>,
 
     #[clap(value_parser, default_values = DEFAULT_DIRECTORIES)]
     directories: Vec<PathBuf>,
@@ -64,9 +76,15 @@ struct GenerateJsonArgs {
     all: bool,
 }
 
+enum TestStatus {
+    Passed,
+    Failed,
+    Skipped,
+}
+
 struct TestResult {
     name: String,
-    passed: bool,
+    status: TestStatus,
 }
 
 #[derive(Serialize, Debug)]
@@ -197,12 +215,8 @@ struct TestInfo {
     metadata: TestMetadata,
 }
 
-fn discover_tests(
-    directories: &[PathBuf],
-    filter_by_current_system: bool,
-) -> Result<Vec<TestInfo>> {
+fn discover_tests(directories: &[PathBuf]) -> Result<Vec<TestInfo>> {
     let mut test_infos = vec![];
-    let current_system = get_current_system();
 
     for directory in directories {
         let paths = fs::read_dir(directory).into_diagnostic()?;
@@ -227,11 +241,6 @@ fn discover_tests(
             // Load test configuration
             let test_config = TestConfig::load_from_path(path)?;
 
-            // Skip tests that don't support current system (if filtering is enabled)
-            if filter_by_current_system && test_config.should_skip_for_system(&current_system) {
-                continue;
-            }
-
             let supported_systems = get_supported_systems_for_config(&test_config);
             let metadata = TestMetadata {
                 name: dir_name.to_string(),
@@ -255,36 +264,61 @@ fn discover_tests(
     Ok(test_infos)
 }
 
+fn build_glob_set(patterns: &[String]) -> Result<GlobSet> {
+    let mut builder = GlobSetBuilder::new();
+    for pattern in patterns {
+        builder.add(
+            Glob::new(pattern)
+                .into_diagnostic()
+                .wrap_err_with(|| format!("Invalid glob pattern: {pattern}"))?,
+        );
+    }
+    builder.build().into_diagnostic()
+}
+
 async fn run_tests_in_directory(args: &RunArgs) -> Result<Vec<TestResult>> {
     let cwd = env::current_dir().into_diagnostic()?;
 
-    // Discover tests (filtered by current system)
-    let mut test_infos = discover_tests(&args.directories, true)?;
+    let mut test_infos = discover_tests(&args.directories)?;
+    let current_system = get_current_system();
+    let mut test_results = vec![];
 
-    // Apply --only and --exclude filters before counting
+    let only_set = build_glob_set(&args.only)?;
+    let exclude_set = build_glob_set(&args.exclude)?;
+
     test_infos.retain(|test_info| {
-        let path = &test_info.path;
-        let dir_name = &test_info.name;
+        let name = &test_info.name;
 
-        if !args.only.is_empty() {
-            if !args.only.iter().any(|only| path.ends_with(only)) {
-                return false;
-            }
-        } else if args.exclude.iter().any(|exclude| path.ends_with(exclude)) {
-            eprintln!("Excluding {dir_name}");
+        if !only_set.is_empty() && !only_set.is_match(name) {
             return false;
         }
+
+        if exclude_set.is_match(name) {
+            eprintln!("Excluding {name}");
+            return false;
+        }
+
+        if test_info.config.should_skip_for_system(&current_system) {
+            eprintln!("Skipping {name} (unsupported system {current_system})");
+            test_results.push(TestResult {
+                name: name.clone(),
+                status: TestStatus::Skipped,
+            });
+            return false;
+        }
+
         true
     });
 
     let total_tests = test_infos.len();
+    let num_skipped = test_results.len();
     eprintln!(
-        "Running {} test{}",
+        "Running {} test{}, {} skipped",
         total_tests,
-        if total_tests == 1 { "" } else { "s" }
+        if total_tests == 1 { "" } else { "s" },
+        num_skipped
     );
 
-    let mut test_results = vec![];
     let mut current_test_num = 0;
 
     // Now iterate over the discovered tests
@@ -360,7 +394,7 @@ async fn run_tests_in_directory(args: &RunArgs) -> Result<Vec<TestResult>> {
 
         // Now load config from the current directory (which might be temp dir)
         let mut config = Config::load_from(&devenv_root)?;
-        for input in args.override_input.chunks_exact(2) {
+        for input in args.override_inputs.chunks_exact(2) {
             config
                 .override_input_url(&input[0], &input[1])
                 .wrap_err(format!(
@@ -373,19 +407,29 @@ async fn run_tests_in_directory(args: &RunArgs) -> Result<Vec<TestResult>> {
         config
             .add_input(
                 "devenv",
-                &format!("path:{}?dir=src/modules", cwd.display()),
+                &format!("git+file:{}?dir=src/modules", cwd.display()),
                 &[],
             )
             .wrap_err("Failed to add devenv input")?;
 
+        let nix_settings = NixSettings {
+            backend: config.backend.clone(),
+            ..NixSettings::default()
+        };
+        let nixpkgs_config = config.nixpkgs_config(&nix_settings.system);
+        let secret_settings = SecretSettings::resolve(SecretOptions::default(), &config);
         let options = DevenvOptions {
-            config,
+            inputs: config.inputs,
+            imports: config.imports,
+            git_root: config.git_root,
+            nixpkgs_config,
+            nix_settings,
+            secret_settings,
             devenv_root: Some(devenv_root.clone()),
             devenv_dotfile: Some(devenv_dotfile),
-            global_options: Some(devenv::GlobalOptions::default()),
             ..Default::default()
         };
-        let devenv = Devenv::new(options).await;
+        let devenv = Devenv::new(options).await?;
 
         eprintln!("  Running {dir_name}");
 
@@ -411,7 +455,7 @@ async fn run_tests_in_directory(args: &RunArgs) -> Result<Vec<TestResult>> {
         }
 
         let status: miette::Result<()> = if test_config.use_shell {
-            devenv.test().await
+            devenv.test(devenv::tasks::VerbosityLevel::Normal).await
         } else {
             // Run .test.sh directly - it must exist when run_test_sh is false
             if PathBuf::from(".test.sh").exists() {
@@ -435,14 +479,13 @@ async fn run_tests_in_directory(args: &RunArgs) -> Result<Vec<TestResult>> {
             }
         };
 
-        let passed = status.is_ok();
-
         eprintln!("{}", "-".repeat(50));
-        if passed {
+        let test_status = if status.is_ok() {
             eprintln!(
                 "✅ [{}/{}] Passed: {}",
                 current_test_num, total_tests, dir_name
             );
+            TestStatus::Passed
         } else {
             eprintln!(
                 "❌ [{}/{}] Failed: {}",
@@ -451,11 +494,12 @@ async fn run_tests_in_directory(args: &RunArgs) -> Result<Vec<TestResult>> {
             if let Err(error) = &status {
                 eprintln!("    Error: {error:?}");
             }
-        }
+            TestStatus::Failed
+        };
 
         let result = TestResult {
             name: dir_name.to_string(),
-            passed,
+            status: test_status,
         };
         test_results.push(result);
 
@@ -468,7 +512,7 @@ async fn run_tests_in_directory(args: &RunArgs) -> Result<Vec<TestResult>> {
 
 #[tokio::main]
 async fn main() -> Result<ExitCode> {
-    devenv_tracing::init_tracing_default();
+    let _tracing_guard = devenv_tracing::init_tracing_default();
 
     // If DEVENV_RUN_TESTS is set, run the tests.
     if env::var("DEVENV_RUN_TESTS") == Ok("1".to_string()) {
@@ -520,7 +564,7 @@ done
 
 # Execute devenv with our devenv override first, then user overrides, then other arguments
 exec '{bin_dir}/devenv' \
-  --override-input devenv 'path:{cwd}?dir=src/modules' \
+  --override-input devenv 'git+file:{cwd}?dir=src/modules' \
   "${{override_inputs[@]}}" \
   "${{other_args[@]}}"
 "#,
@@ -578,7 +622,9 @@ exec '{bin_dir}/devenv' \
     if let Ok(tzdir) = env::var("TZDIR") {
         env.push(("TZDIR", tzdir));
     }
-    // RUST_LOG is needed for tests that verify environment variable handling
+    // Only pass through RUST_LOG if explicitly set in the parent environment.
+    // Do not default it — setting RUST_LOG=info would suppress debug-level trace
+    // output from devenv --verbose, breaking tests that grep trace logs.
     if let Ok(rust_log) = env::var("RUST_LOG") {
         env.push(("RUST_LOG", rust_log));
     }
@@ -608,21 +654,29 @@ async fn execute_command(args: &Args) -> Result<()> {
 
 async fn run_tests(args: &RunArgs) -> Result<()> {
     let test_results = run_tests_in_directory(args).await?;
-    let num_tests = test_results.len();
-    let num_failed_tests = test_results.iter().filter(|r| !r.passed).count();
+
+    let mut num_passed = 0;
+    let mut num_failed = 0;
+    let mut num_skipped = 0;
 
     eprintln!();
 
-    for result in test_results {
-        if !result.passed {
-            eprintln!("{}: Failed", result.name);
-        };
+    for result in &test_results {
+        match &result.status {
+            TestStatus::Passed => num_passed += 1,
+            TestStatus::Failed => {
+                num_failed += 1;
+                eprintln!("{}: Failed", result.name);
+            }
+            TestStatus::Skipped => num_skipped += 1,
+        }
     }
 
+    let num_ran = num_passed + num_failed;
     eprintln!();
-    eprintln!("Ran {num_tests} tests, {num_failed_tests} failed.");
+    eprintln!("Ran {num_ran} tests, {num_failed} failed, {num_skipped} skipped.");
 
-    if num_failed_tests > 0 {
+    if num_failed > 0 {
         Err(miette::miette!("Some tests failed"))
     } else {
         Ok(())
@@ -630,8 +684,12 @@ async fn run_tests(args: &RunArgs) -> Result<()> {
 }
 
 async fn generate_json(args: &GenerateJsonArgs) -> Result<()> {
-    // Discover tests (filter by current system unless --all is specified)
-    let test_infos = discover_tests(&args.directories, !args.all)?;
+    let mut test_infos = discover_tests(&args.directories)?;
+
+    if !args.all {
+        let current_system = get_current_system();
+        test_infos.retain(|info| !info.config.should_skip_for_system(&current_system));
+    }
 
     // Extract just the metadata for JSON output
     let test_metadata: Vec<TestMetadata> =

@@ -5,6 +5,7 @@
 //!
 //! Also exports shared UI constants used by both devenv-shell and devenv-tui.
 
+use crossterm::{cursor, queue, style::ResetColor, terminal::Clear, terminal::ClearType};
 use iocraft::prelude::*;
 use std::collections::HashSet;
 use std::io::{self, Write};
@@ -15,10 +16,10 @@ use std::time::Instant;
 // Shared UI constants - used by both devenv-shell and devenv-tui
 // ============================================================================
 
-/// Bright white for active/in-progress items
-pub const COLOR_ACTIVE: Color = Color::AnsiValue(255);
-/// Dimmer white for nested active items
-pub const COLOR_ACTIVE_NESTED: Color = Color::AnsiValue(246);
+/// Default foreground for active/in-progress items (adapts to terminal theme)
+pub const COLOR_ACTIVE: Color = Color::Reset;
+/// Dimmer text for nested active items
+pub const COLOR_ACTIVE_NESTED: Color = Color::DarkGrey;
 /// Gray for secondary text (cached, phases, etc.)
 pub const COLOR_SECONDARY: Color = Color::AnsiValue(242);
 /// Gray for tree lines and elapsed time
@@ -46,43 +47,47 @@ pub const CHECKMARK: &str = "✓";
 /// Failure X character
 pub const XMARK: &str = "✗";
 
+/// Keybind labels (short, long) for status line actions.
+/// Short form uses ⌥ (Option symbol). Long form uses "Opt" on macOS, "Alt" elsewhere.
+/// When deterministic-tui is enabled, always use "Alt" for reproducible snapshots.
+#[cfg(feature = "deterministic-tui")]
+const KEYBIND_ERROR: (&str, &str) = ("^⌥E", "Ctrl-Alt-E");
+#[cfg(all(not(feature = "deterministic-tui"), target_os = "macos"))]
+const KEYBIND_ERROR: (&str, &str) = ("^⌥E", "Ctrl-Opt-E");
+#[cfg(all(not(feature = "deterministic-tui"), not(target_os = "macos")))]
+const KEYBIND_ERROR: (&str, &str) = ("^⌥E", "Ctrl-Alt-E");
+#[cfg(feature = "deterministic-tui")]
+const KEYBIND_PAUSE: (&str, &str) = ("^⌥D", "Ctrl-Alt-D");
+#[cfg(all(not(feature = "deterministic-tui"), target_os = "macos"))]
+const KEYBIND_PAUSE: (&str, &str) = ("^⌥D", "Ctrl-Opt-D");
+#[cfg(all(not(feature = "deterministic-tui"), not(target_os = "macos")))]
+const KEYBIND_PAUSE: (&str, &str) = ("^⌥D", "Ctrl-Alt-D");
+
 /// Current status state.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct StatusState {
     /// Files that changed (shown during build/reload).
     pub changed_files: Vec<PathBuf>,
     /// Whether a build is in progress (evaluating nix).
     pub building: bool,
-    /// Whether a reload is ready (waiting for user).
+    /// Whether a reload is ready (auto-applies at next prompt).
     pub reload_ready: bool,
+    /// Whether the environment was just reloaded.
+    pub reloaded: bool,
+    /// When the reloaded state was set (for auto-clearing after timeout).
+    pub reloaded_at: Option<Instant>,
     /// Error message if build failed.
     pub error: Option<String>,
     /// Whether the error details are expanded (toggled by keybind).
     pub show_error: bool,
     /// Whether file watching is paused.
     pub paused: bool,
-    /// Files being watched for changes.
-    pub watched_files: Vec<PathBuf>,
+    /// Number of files being watched for changes.
+    pub watched_file_count: usize,
     /// When the current build started (for timing).
     build_start: Option<Instant>,
     /// Duration of the last completed build.
     pub build_duration: Option<std::time::Duration>,
-}
-
-impl Default for StatusState {
-    fn default() -> Self {
-        Self {
-            changed_files: Vec::new(),
-            building: false,
-            reload_ready: false,
-            error: None,
-            show_error: false,
-            paused: false,
-            watched_files: Vec::new(),
-            build_start: None,
-            build_duration: None,
-        }
-    }
 }
 
 impl StatusState {
@@ -95,6 +100,8 @@ impl StatusState {
     pub fn set_building(&mut self, changed_files: Vec<PathBuf>) {
         self.building = true;
         self.reload_ready = false;
+        self.reloaded = false;
+        self.reloaded_at = None;
         self.changed_files = changed_files;
         self.error = None;
         self.show_error = false;
@@ -126,15 +133,43 @@ impl StatusState {
         self.error = Some(error);
     }
 
-    /// Set a custom message (for backwards compatibility).
-    pub fn set_message(&mut self, _message: String) {
-        // No-op for now, state is tracked via building/reload_ready/error
+    /// Update state after reload was applied.
+    pub fn set_reloaded(&mut self) {
+        self.building = false;
+        self.reload_ready = false;
+        self.reloaded = true;
+        self.reloaded_at = Some(Instant::now());
+        self.changed_files.clear();
+        self.error = None;
+        self.show_error = false;
+        // keep build_duration and watched_file_count
+    }
+
+    /// Duration until the reloaded state should auto-clear.
+    pub fn reloaded_remaining(&self) -> Option<std::time::Duration> {
+        const RELOADED_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+        self.reloaded_at.and_then(|at| {
+            let elapsed = at.elapsed();
+            if elapsed >= RELOADED_TIMEOUT {
+                None
+            } else {
+                Some(RELOADED_TIMEOUT - elapsed)
+            }
+        })
+    }
+
+    /// Clear the reloaded state (called when timeout expires).
+    pub fn clear_reloaded(&mut self) {
+        self.reloaded = false;
+        self.reloaded_at = None;
     }
 
     /// Clear the status.
     pub fn clear(&mut self) {
         self.building = false;
         self.reload_ready = false;
+        self.reloaded = false;
+        self.reloaded_at = None;
         self.changed_files.clear();
         self.error = None;
         self.show_error = false;
@@ -145,24 +180,28 @@ impl StatusState {
         self.paused = paused;
     }
 
-    /// Set watched files.
-    pub fn set_watched_files(&mut self, files: Vec<PathBuf>) {
-        self.watched_files = files;
+    /// Set watched file count.
+    pub fn set_watched_file_count(&mut self, count: usize) {
+        self.watched_file_count = count;
     }
 
     /// Check if there's any status to display.
     pub fn has_status(&self) -> bool {
         self.building
             || self.reload_ready
+            || self.reloaded
             || self.error.is_some()
             || self.paused
-            || !self.watched_files.is_empty()
+            || self.watched_file_count > 0
     }
 }
 
 /// Format duration for display, returning (number, unit) for separate coloring.
 /// E.g., ("250", "ms"), ("1.2", "s"), ("2m 30", "s")
 fn format_duration_parts(duration: std::time::Duration) -> (String, String) {
+    if cfg!(feature = "deterministic-tui") {
+        return ("[TIME]".to_string(), String::new());
+    }
     let total_secs = duration.as_secs();
     if total_secs < 1 {
         (format!("{}", duration.as_millis()), "ms".to_string())
@@ -224,6 +263,35 @@ fn format_changed_files(changed_files: &[PathBuf], max_len: usize) -> String {
     format!("{} files", files.len())
 }
 
+/// Select short or long keybind label based on terminal width.
+fn keybind_label(keybind: (&'static str, &'static str), use_short: bool) -> &'static str {
+    if use_short { keybind.0 } else { keybind.1 }
+}
+
+/// Build "in N.Ns" duration elements, or empty if no duration recorded.
+fn duration_elements(state: &StatusState) -> Vec<AnyElement<'static>> {
+    let Some((num, unit)) = state.build_duration.map(format_duration_parts) else {
+        return vec![];
+    };
+    vec![
+        element!(Text(content: " in ", color: COLOR_SECONDARY)).into_any(),
+        element!(Text(content: num, color: COLOR_COMPLETED)).into_any(),
+        element!(Text(content: unit, color: COLOR_SECONDARY)).into_any(),
+    ]
+}
+
+/// Build "| watching N files" elements, or empty if no watched files.
+fn watching_elements(count: usize) -> Vec<AnyElement<'static>> {
+    if count == 0 {
+        return vec![];
+    }
+    vec![
+        element!(Text(content: " | watching ", color: COLOR_SECONDARY)).into_any(),
+        element!(Text(content: count.to_string(), color: COLOR_COMPLETED)).into_any(),
+        element!(Text(content: " files", color: COLOR_SECONDARY)).into_any(),
+    ]
+}
+
 /// Status line manager using iocraft for rendering.
 pub struct StatusLine {
     state: StatusState,
@@ -245,13 +313,11 @@ impl StatusLine {
         }
     }
 
-    /// Create with default settings (for backwards compatibility).
-    pub fn with_defaults() -> Self {
-        Self::new()
-    }
-
     /// Advance spinner animation if enough time has passed.
     fn update_spinner(&mut self) {
+        if cfg!(feature = "deterministic-tui") {
+            return;
+        }
         let elapsed = self.last_spinner_update.elapsed().as_millis() as u64;
         if elapsed >= SPINNER_INTERVAL_MS {
             self.spinner_frame = (self.spinner_frame + 1) % SPINNER_FRAMES.len();
@@ -284,8 +350,10 @@ impl StatusLine {
         &self.state
     }
 
-    /// Draw the status line at the bottom of the terminal.
-    pub fn draw(&mut self, stdout: &mut impl Write, cols: u16) -> io::Result<()> {
+    /// Draw the status line at the given row of the terminal.
+    ///
+    /// The caller is responsible for repositioning the cursor after this call.
+    pub fn draw(&mut self, stdout: &mut impl Write, cols: u16, total_rows: u16) -> io::Result<()> {
         if !self.enabled {
             return Ok(());
         }
@@ -293,7 +361,7 @@ impl StatusLine {
         // Update spinner animation
         self.update_spinner();
 
-        // Build the status line content first (before any cursor movement)
+        // Build the status line content
         let mut element = self.build_element(cols);
         let canvas = element.render(Some(cols as usize));
         let mut content = Vec::new();
@@ -303,15 +371,14 @@ impl StatusLine {
             content.truncate(pos);
         }
 
-        // Write everything in one batch to minimize flicker:
-        // 1. Hide cursor, reset origin mode (DECOM off for absolute coords), save position
-        // 2. Move to status line (row 999) + clear + write content
-        // 3. Restore position + show cursor
-        // Using raw escape sequences to avoid multiple flushes from execute! macro
-        write!(stdout, "\x1b[?25l\x1b[?6l\x1b7\x1b[999;1H\x1b[2K")?;
+        // Move to the last row, clear it, write content
+        queue!(
+            stdout,
+            cursor::MoveTo(0, total_rows - 1),
+            Clear(ClearType::CurrentLine)
+        )?;
         stdout.write_all(&content)?;
-        write!(stdout, "\x1b8\x1b[?25h")?;
-        stdout.flush()?;
+        queue!(stdout, ResetColor)?;
 
         Ok(())
     }
@@ -320,11 +387,6 @@ impl StatusLine {
     pub fn build_element(&self, width: u16) -> AnyElement<'static> {
         // Use short keybind notation for narrow terminals
         let use_short = width < 60;
-
-        // Watching file count used by several states
-        let watch_count = self.state.watched_files.len();
-        let watch_count_str = format!("{}", watch_count);
-        let has_watching = watch_count > 0;
 
         if self.state.building {
             // Building state: spinner + elapsed time + changed files
@@ -359,7 +421,7 @@ impl StatusLine {
                         #(if has_changed_files {
                             vec![
                                 element!(Text(content: ", changed ", color: COLOR_SECONDARY)).into_any(),
-                                element!(Text(content: files_str.clone(), color: COLOR_COMPLETED)).into_any(),
+                                element!(Text(content: files_str, color: COLOR_COMPLETED)).into_any(),
                             ]
                         } else {
                             vec![]
@@ -369,14 +431,9 @@ impl StatusLine {
             }
             .into_any()
         } else if self.state.reload_ready {
-            // Ready state
-            let (duration_num, duration_unit) = self
-                .state
-                .build_duration
-                .map(|d| format_duration_parts(d))
-                .unwrap_or_default();
-            let has_duration = !duration_num.is_empty();
-            let keybind = if use_short { "^⌥r" } else { "Ctrl-Alt-R" };
+            // Ready state (auto-reloads at next prompt)
+            let duration = duration_elements(&self.state);
+            let watching = watching_elements(self.state.watched_file_count);
 
             element! {
                 View(width: width as u32, height: 1, flex_direction: FlexDirection::Row, justify_content: JustifyContent::SpaceBetween, padding_left: 1, padding_right: 1) {
@@ -386,41 +443,36 @@ impl StatusLine {
                         }
                         Text(content: "devenv ", color: COLOR_SECONDARY)
                         Text(content: "ready", weight: Weight::Bold, color: COLOR_ACTIVE)
-                        #(if has_duration {
-                            vec![
-                                element!(Text(content: " in ", color: COLOR_SECONDARY)).into_any(),
-                                element!(Text(content: duration_num, color: COLOR_COMPLETED)).into_any(),
-                                element!(Text(content: duration_unit.clone(), color: COLOR_SECONDARY)).into_any(),
-                            ]
-                        } else {
-                            vec![]
-                        })
-                        #(if has_watching {
-                            vec![
-                                element!(Text(content: " | watching ", color: COLOR_SECONDARY)).into_any(),
-                                element!(Text(content: watch_count_str.clone(), color: COLOR_COMPLETED)).into_any(),
-                                element!(Text(content: " files", color: COLOR_SECONDARY)).into_any(),
-                            ]
-                        } else {
-                            vec![]
-                        })
-                    }
-                    View(flex_direction: FlexDirection::Row, flex_shrink: 0.0, margin_left: 2) {
-                        Text(content: keybind.to_string(), color: COLOR_INTERACTIVE)
-                        Text(content: " reload")
+                        #(duration)
+                        #(watching)
                     }
                 }
             }
             .into_any()
-        } else if let Some(ref _error) = self.state.error {
+        } else if self.state.reloaded {
+            // Reloaded state (environment was applied)
+            let duration = duration_elements(&self.state);
+            let watching = watching_elements(self.state.watched_file_count);
+
+            element! {
+                View(width: width as u32, height: 1, flex_direction: FlexDirection::Row, justify_content: JustifyContent::SpaceBetween, padding_left: 1, padding_right: 1) {
+                    View(flex_direction: FlexDirection::Row, flex_grow: 1.0, min_width: 0, overflow: Overflow::Hidden) {
+                        View(margin_right: 1) {
+                            Text(content: CHECKMARK, color: COLOR_COMPLETED)
+                        }
+                        Text(content: "devenv ", color: COLOR_SECONDARY)
+                        Text(content: "reloaded", weight: Weight::Bold, color: COLOR_COMPLETED)
+                        #(duration)
+                        #(watching)
+                    }
+                }
+            }
+            .into_any()
+        } else if self.state.error.is_some() {
             // Failed state
-            let (duration_num, duration_unit) = self
-                .state
-                .build_duration
-                .map(|d| format_duration_parts(d))
-                .unwrap_or_default();
-            let has_duration = !duration_num.is_empty();
-            let error_keybind = if use_short { "^⌥e" } else { "Ctrl-Alt-E" };
+            let duration = duration_elements(&self.state);
+            let watching = watching_elements(self.state.watched_file_count);
+            let keybind = keybind_label(KEYBIND_ERROR, use_short);
             let error_action = if self.state.show_error {
                 " hide error"
             } else {
@@ -435,55 +487,40 @@ impl StatusLine {
                         }
                         Text(content: "devenv ", color: COLOR_SECONDARY)
                         Text(content: "failed", weight: Weight::Bold, color: COLOR_FAILED)
-                        #(if has_duration {
-                            vec![
-                                element!(Text(content: " in ", color: COLOR_SECONDARY)).into_any(),
-                                element!(Text(content: duration_num, color: COLOR_COMPLETED)).into_any(),
-                                element!(Text(content: duration_unit.clone(), color: COLOR_SECONDARY)).into_any(),
-                            ]
-                        } else {
-                            vec![]
-                        })
-                        #(if has_watching {
-                            vec![
-                                element!(Text(content: " | watching ", color: COLOR_SECONDARY)).into_any(),
-                                element!(Text(content: watch_count_str.clone(), color: COLOR_COMPLETED)).into_any(),
-                                element!(Text(content: " files", color: COLOR_SECONDARY)).into_any(),
-                            ]
-                        } else {
-                            vec![]
-                        })
+                        #(duration)
+                        #(watching)
                     }
                     View(flex_direction: FlexDirection::Row, flex_shrink: 0.0, margin_left: 2) {
-                        Text(content: error_keybind.to_string(), color: COLOR_INTERACTIVE)
+                        Text(content: keybind, color: COLOR_INTERACTIVE)
                         Text(content: error_action)
                     }
                 }
             }
             .into_any()
         } else if self.state.paused {
-            // Paused state: no file count
-            let pause_keybind = if use_short { "^⌥d" } else { "Ctrl-Alt-D" };
+            // Paused state
+            let keybind = keybind_label(KEYBIND_PAUSE, use_short);
 
             element! {
                 View(width: width as u32, height: 1, flex_direction: FlexDirection::Row, justify_content: JustifyContent::SpaceBetween, padding_left: 1, padding_right: 1) {
                     View(flex_direction: FlexDirection::Row, flex_grow: 1.0, min_width: 0, overflow: Overflow::Hidden) {
-                        View(margin_right: 1) {
+                        View(margin_right: 2) {
                             Text(content: "⏸", color: COLOR_SECONDARY)
                         }
                         Text(content: "devenv ", color: COLOR_SECONDARY)
                         Text(content: "paused", weight: Weight::Bold, color: COLOR_ACTIVE)
                     }
                     View(flex_direction: FlexDirection::Row, flex_shrink: 0.0, margin_left: 2) {
-                        Text(content: pause_keybind.to_string(), color: COLOR_INTERACTIVE)
+                        Text(content: keybind, color: COLOR_INTERACTIVE)
                         Text(content: " resume")
                     }
                 }
             }
             .into_any()
-        } else if !self.state.watched_files.is_empty() {
+        } else if self.state.watched_file_count > 0 {
             // Watching state
-            let pause_keybind = if use_short { "^⌥d" } else { "Ctrl-Alt-D" };
+            let keybind = keybind_label(KEYBIND_PAUSE, use_short);
+            let count_str = self.state.watched_file_count.to_string();
 
             element! {
                 View(width: width as u32, height: 1, flex_direction: FlexDirection::Row, justify_content: JustifyContent::SpaceBetween, padding_left: 1, padding_right: 1) {
@@ -493,11 +530,11 @@ impl StatusLine {
                         }
                         Text(content: "devenv ", color: COLOR_SECONDARY)
                         Text(content: "watching ", weight: Weight::Bold, color: COLOR_ACTIVE)
-                        Text(content: watch_count_str, color: COLOR_COMPLETED)
+                        Text(content: count_str, color: COLOR_COMPLETED)
                         Text(content: " files", color: COLOR_SECONDARY)
                     }
                     View(flex_direction: FlexDirection::Row, flex_shrink: 0.0, margin_left: 2) {
-                        Text(content: pause_keybind.to_string(), color: COLOR_INTERACTIVE)
+                        Text(content: keybind, color: COLOR_INTERACTIVE)
                         Text(content: " pause")
                     }
                 }

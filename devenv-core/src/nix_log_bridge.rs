@@ -43,6 +43,47 @@ struct EvalActivityState {
     current_eval_id: Option<u64>,
 }
 
+/// Tracks per-activity expected counts and computes category totals.
+///
+/// Nix emits absolute expected counts per activity, potentially re-reporting
+/// the same value many times. This tracker deduplicates per-activity counts
+/// and computes correct totals by summing across all activities per category.
+#[derive(Debug, Default)]
+struct ExpectedCountTracker {
+    counts: HashMap<(u64, ExpectedCategory), u64>,
+}
+
+impl ExpectedCountTracker {
+    /// Update the expected count for an activity.
+    /// Returns `Some(total)` if the category total changed, `None` otherwise.
+    #[must_use]
+    fn update(
+        &mut self,
+        activity_id: u64,
+        category: ExpectedCategory,
+        expected: u64,
+    ) -> Option<u64> {
+        let key = (activity_id, category);
+        let prev = self.counts.insert(key, expected);
+        if prev == Some(expected) {
+            return None;
+        }
+        let total = self
+            .counts
+            .iter()
+            .filter(|((_, c), _)| *c == category)
+            .map(|(_, v)| v)
+            .sum();
+        Some(total)
+    }
+
+    /// Remove all counts for an activity (called when it stops).
+    /// Does not re-emit totals — we don't want the UI count to go down.
+    fn remove_activity(&mut self, activity_id: u64) {
+        self.counts.retain(|&(id, _), _| id != activity_id);
+    }
+}
+
 /// Bridge that converts Nix internal logs to tracing events.
 ///
 /// The bridge manages eval activity lifecycle with lazy creation - the activity
@@ -57,6 +98,7 @@ pub struct NixLogBridge {
     observers: Mutex<Vec<Arc<dyn OpObserver>>>,
     /// Error messages to be printed after TUI exits, before entering REPL
     pre_repl_errors: Mutex<Vec<String>>,
+    expected_counts: Mutex<ExpectedCountTracker>,
 }
 
 /// Information about an active Nix activity
@@ -91,6 +133,7 @@ impl NixLogBridge {
             }),
             observers: Mutex::new(Vec::new()),
             pre_repl_errors: Mutex::new(Vec::new()),
+            expected_counts: Mutex::new(ExpectedCountTracker::default()),
         })
     }
 
@@ -140,10 +183,23 @@ impl NixLogBridge {
         }
     }
 
-    /// Clear all observers after evaluation completes.
+    /// Remove a previously-added observer by `Arc` identity.
     ///
-    /// This should be called after evaluation to stop notifying observers
-    /// and allow them to be garbage collected.
+    /// Intended for scoped observers that run alongside long-lived ones
+    /// (e.g. a per-eval collector registered for the duration of a concurrent
+    /// Nix FFI call). Production code that needs a permanent observer should
+    /// register it once at construction and leave it in place.
+    pub fn remove_observer(&self, observer: &Arc<dyn OpObserver>) {
+        if let Ok(mut guard) = self.observers.lock() {
+            guard.retain(|o| !Arc::ptr_eq(o, observer));
+        }
+    }
+
+    /// Clear all observers.
+    ///
+    /// Exposed primarily for tests that need to reset bridge state between
+    /// scenarios. Production code registers long-lived observers at
+    /// construction and lets them live for the bridge's lifetime.
     pub fn clear_observers(&self) {
         if let Ok(mut guard) = self.observers.lock() {
             guard.clear();
@@ -235,12 +291,9 @@ impl NixLogBridge {
             InternalLog::Msg { level, ref msg, .. } => {
                 // Extract any input operation from the log for caching
                 if let Some(op) = EvalOp::from_internal_log(&log) {
-                    // Notify all active observers
                     if let Ok(guard) = self.observers.lock() {
                         for observer in guard.iter() {
-                            if observer.is_active() {
-                                observer.on_op(op.clone());
-                            }
+                            observer.record(op.clone());
                         }
                     }
 
@@ -317,11 +370,12 @@ impl NixLogBridge {
 
                 let derivation_name = extract_derivation_name(&derivation_path);
 
-                let activity = Activity::build(derivation_name)
-                    .id(activity_id)
-                    .derivation_path(derivation_path)
-                    .parent(parent_id)
-                    .start();
+                let activity = devenv_activity::start!(
+                    Activity::build(derivation_name)
+                        .id(activity_id)
+                        .derivation_path(derivation_path)
+                        .parent(parent_id)
+                );
 
                 self.insert_activity(activity_id, activity_type, activity);
             }
@@ -334,11 +388,12 @@ impl NixLogBridge {
 
                 let derivation_name = extract_derivation_name(&derivation_path);
 
-                let activity = Activity::build(derivation_name)
-                    .id(activity_id)
-                    .derivation_path(derivation_path)
-                    .parent(parent_id)
-                    .queue();
+                let activity = devenv_activity::queue!(
+                    Activity::build(derivation_name)
+                        .id(activity_id)
+                        .derivation_path(derivation_path)
+                        .parent(parent_id)
+                );
 
                 self.insert_activity(activity_id, activity_type, activity);
             }
@@ -353,7 +408,7 @@ impl NixLogBridge {
                     if let Some(url) = substituter {
                         builder = builder.url(url);
                     }
-                    let activity = builder.start();
+                    let activity = devenv_activity::start!(builder);
 
                     self.insert_activity(activity_id, activity_type, activity);
                 }
@@ -372,25 +427,28 @@ impl NixLogBridge {
                     let activity = if is_local_copy {
                         // Local copy to the store - use the full source path as the name
                         let source_path = source_uri.as_ref().unwrap();
-                        Activity::fetch(FetchKind::Copy, source_path)
-                            .id(activity_id)
-                            .parent(parent_id)
-                            .start()
+                        devenv_activity::start!(
+                            Activity::fetch(FetchKind::Copy, source_path)
+                                .id(activity_id)
+                                .parent(parent_id)
+                        )
                     } else if let Some(url) = source_uri {
                         // Remote download from substituter
                         let package_name = extract_package_name(&store_path);
-                        Activity::fetch(FetchKind::Download, package_name)
-                            .id(activity_id)
-                            .parent(parent_id)
-                            .url(url)
-                            .start()
+                        devenv_activity::start!(
+                            Activity::fetch(FetchKind::Download, package_name)
+                                .id(activity_id)
+                                .parent(parent_id)
+                                .url(url)
+                        )
                     } else {
                         // No source URI - treat as local copy with store path name
                         let package_name = extract_package_name(&store_path);
-                        Activity::fetch(FetchKind::Copy, package_name)
-                            .id(activity_id)
-                            .parent(parent_id)
-                            .start()
+                        devenv_activity::start!(
+                            Activity::fetch(FetchKind::Copy, package_name)
+                                .id(activity_id)
+                                .parent(parent_id)
+                        )
                     };
 
                     self.insert_activity(activity_id, activity_type, activity);
@@ -408,16 +466,17 @@ impl NixLogBridge {
                     if let Some(url) = substituter {
                         builder = builder.url(url);
                     }
-                    let activity = builder.start();
+                    let activity = devenv_activity::start!(builder);
 
                     self.insert_activity(activity_id, activity_type, activity);
                 }
             }
             ActivityType::FetchTree => {
-                let activity = Activity::fetch(FetchKind::Tree, text)
-                    .id(activity_id)
-                    .parent(parent_id)
-                    .start();
+                let activity = devenv_activity::start!(
+                    Activity::fetch(FetchKind::Tree, text)
+                        .id(activity_id)
+                        .parent(parent_id)
+                );
 
                 self.insert_activity(activity_id, activity_type, activity);
             }
@@ -431,7 +490,7 @@ impl NixLogBridge {
                 if let Some(url) = url {
                     builder = builder.url(url);
                 }
-                let activity = builder.start();
+                let activity = devenv_activity::start!(builder);
 
                 self.insert_activity(activity_id, activity_type, activity);
             }
@@ -449,6 +508,10 @@ impl NixLogBridge {
 
     /// Handle the stop of a Nix activity
     fn handle_activity_stop(&self, activity_id: u64, success: bool) {
+        if let Ok(mut tracker) = self.expected_counts.lock() {
+            tracker.remove_activity(activity_id);
+        }
+
         let Ok(mut activities) = self.active_activities.lock() else {
             return;
         };
@@ -527,7 +590,8 @@ impl NixLogBridge {
             ResultType::SetExpected => {
                 // Handle expected count announcements from Nix.
                 // fields[0] is the ActivityType (as int), fields[1] is the expected count.
-                // This announces aggregate expected counts (e.g., "expect 10 downloads").
+                // Nix emits absolute counts per activity, potentially re-reporting the same
+                // value many times. We track per-activity and only emit when the total changes.
                 if let (Some(Field::Int(activity_type_int)), Some(Field::Int(expected))) =
                     (fields.first(), fields.get(1))
                 {
@@ -544,8 +608,11 @@ impl NixLogBridge {
                             _ => None,
                         });
 
-                    if let Some(cat) = category {
-                        set_expected(cat, *expected);
+                    if let Some(cat) = category
+                        && let Ok(mut tracker) = self.expected_counts.lock()
+                        && let Some(total) = tracker.update(activity_id, cat, *expected)
+                    {
+                        set_expected(cat, total);
                     }
                 }
             }
@@ -804,5 +871,155 @@ mod tests {
         let (summary, details) = parse_nix_error("error: something went wrong");
         assert_eq!(summary, "error: something went wrong");
         assert!(details.is_none());
+    }
+
+    #[test]
+    fn test_expected_count_single_activity() {
+        let mut tracker = ExpectedCountTracker::default();
+
+        // First report: activity 1 expects 5 downloads
+        assert_eq!(tracker.update(1, ExpectedCategory::Download, 5), Some(5),);
+
+        // Same value again: no change
+        assert_eq!(tracker.update(1, ExpectedCategory::Download, 5), None,);
+
+        // Updated count: activity 1 now expects 10 downloads
+        assert_eq!(tracker.update(1, ExpectedCategory::Download, 10), Some(10),);
+    }
+
+    #[test]
+    fn test_expected_count_multiple_activities_same_category() {
+        let mut tracker = ExpectedCountTracker::default();
+
+        // Activity 1 expects 5 downloads
+        assert_eq!(tracker.update(1, ExpectedCategory::Download, 5), Some(5),);
+
+        // Activity 2 expects 3 downloads — total is 8
+        assert_eq!(tracker.update(2, ExpectedCategory::Download, 3), Some(8),);
+
+        // Activity 1 re-reports 5 — no change
+        assert_eq!(tracker.update(1, ExpectedCategory::Download, 5), None,);
+
+        // Activity 2 updates to 7 — total is 12
+        assert_eq!(tracker.update(2, ExpectedCategory::Download, 7), Some(12),);
+    }
+
+    #[test]
+    fn test_expected_count_independent_categories() {
+        let mut tracker = ExpectedCountTracker::default();
+
+        // Builds and downloads tracked independently
+        assert_eq!(tracker.update(1, ExpectedCategory::Build, 3), Some(3),);
+        assert_eq!(tracker.update(1, ExpectedCategory::Download, 10), Some(10),);
+        assert_eq!(tracker.update(2, ExpectedCategory::Build, 2), Some(5),);
+
+        // Download total should still be 10
+        assert_eq!(tracker.update(1, ExpectedCategory::Download, 10), None,);
+    }
+
+    #[test]
+    fn test_expected_count_remove_activity() {
+        let mut tracker = ExpectedCountTracker::default();
+
+        let _ = tracker.update(1, ExpectedCategory::Download, 5);
+        let _ = tracker.update(2, ExpectedCategory::Download, 3);
+
+        // Remove activity 1 — only activity 2 remains
+        tracker.remove_activity(1);
+
+        // Activity 3 reports 2 downloads — total is 3 + 2 = 5 (activity 1 is gone)
+        assert_eq!(tracker.update(3, ExpectedCategory::Download, 2), Some(5),);
+    }
+
+    #[test]
+    fn test_expected_count_remove_cleans_all_categories() {
+        let mut tracker = ExpectedCountTracker::default();
+
+        let _ = tracker.update(1, ExpectedCategory::Build, 3);
+        let _ = tracker.update(1, ExpectedCategory::Download, 5);
+
+        tracker.remove_activity(1);
+
+        // Both categories should start fresh
+        assert_eq!(tracker.update(2, ExpectedCategory::Build, 1), Some(1),);
+        assert_eq!(tracker.update(2, ExpectedCategory::Download, 1), Some(1),);
+    }
+
+    /// Helper: create a mock observer that records ops in a shared Vec.
+    struct MockObserver {
+        ops: Mutex<Vec<EvalOp>>,
+    }
+
+    impl MockObserver {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                ops: Mutex::new(Vec::new()),
+            })
+        }
+
+        fn collected_ops(&self) -> Vec<EvalOp> {
+            self.ops.lock().unwrap().clone()
+        }
+    }
+
+    impl OpObserver for MockObserver {
+        fn record(&self, op: EvalOp) {
+            self.ops.lock().unwrap().push(op);
+        }
+    }
+
+    #[test]
+    fn test_add_observer_receives_dispatched_ops() {
+        let bridge = NixLogBridge::new();
+        let observer = MockObserver::new();
+        bridge.add_observer(observer.clone());
+
+        bridge.process_internal_log(InternalLog::Msg {
+            level: Verbosity::Talkative,
+            msg: "evaluating file '/tmp/default.nix'".into(),
+            raw_msg: None,
+        });
+
+        assert_eq!(observer.collected_ops().len(), 1);
+        assert_eq!(
+            observer.collected_ops()[0],
+            EvalOp::EvaluatedFile {
+                source: "/tmp/default.nix".into()
+            }
+        );
+    }
+
+    #[test]
+    fn test_multiple_observers_all_receive_ops() {
+        let bridge = NixLogBridge::new();
+        let obs1 = MockObserver::new();
+        let obs2 = MockObserver::new();
+        bridge.add_observer(obs1.clone());
+        bridge.add_observer(obs2.clone());
+
+        bridge.process_internal_log(InternalLog::Msg {
+            level: Verbosity::Talkative,
+            msg: "evaluating file '/tmp/default.nix'".into(),
+            raw_msg: None,
+        });
+
+        assert_eq!(obs1.collected_ops().len(), 1);
+        assert_eq!(obs2.collected_ops().len(), 1);
+    }
+
+    #[test]
+    fn test_clear_observers_drops_all() {
+        let bridge = NixLogBridge::new();
+        let observer = MockObserver::new();
+        bridge.add_observer(observer.clone());
+        bridge.clear_observers();
+
+        bridge.process_internal_log(InternalLog::Msg {
+            level: Verbosity::Talkative,
+            msg: "evaluating file '/tmp/default.nix'".into(),
+            raw_msg: None,
+        });
+
+        assert_eq!(observer.collected_ops().len(), 0);
     }
 }

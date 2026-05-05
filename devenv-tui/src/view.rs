@@ -1,32 +1,56 @@
 use crate::{
-    components::{LOG_VIEWPORT_FAILED, LOG_VIEWPORT_SHOW_OUTPUT, format_elapsed_time, *},
+    components::{LOG_VIEWPORT_FAILED, LOG_VIEWPORT_SHOW_OUTPUT, *},
     model::{
-        Activity, ActivityModel, ActivitySummary, ActivityVariant, NixActivityState, RenderContext,
-        TaskDisplayStatus, TerminalSize, UiState,
+        Activity, ActivityModel, ActivitySummary, ActivityVariant, DisplayActivity,
+        NixActivityState, RenderContext, TaskDisplayStatus, TerminalSize, UiState,
     },
 };
 use devenv_activity::{ActivityLevel, ProcessStatus};
 use human_repr::{HumanCount, HumanDuration};
 use iocraft::Context;
 use iocraft::components::ContextProvider;
+use iocraft::hooks::UseComponentRect;
 use iocraft::prelude::*;
+use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Duration;
+
+/// Height reserved for the bottom summary bar (1 line content + 1 line margin_top).
+pub const SUMMARY_BAR_HEIGHT: u16 = 2;
+
+/// Map from activity_id to rendered height in lines.
+pub type ActivityHeights = Ref<HashMap<u64, i32>>;
+
+/// Scroll state and the display list the app already computed for this frame.
+///
+/// Passing `display_activities` through avoids re-walking the activity tree
+/// inside `view()`; the app needs the same list to measure heights before
+/// rendering.
+pub struct ScrollState {
+    pub handle: Option<Ref<ScrollViewHandle>>,
+    pub display_activities: Vec<DisplayActivity>,
+}
 
 /// Main view function that creates the UI
 pub fn view(
     model: &ActivityModel,
     ui_state: &UiState,
     render_context: RenderContext,
+    scroll: Option<ScrollState>,
+    shutting_down: bool,
 ) -> impl Into<AnyElement<'static>> {
-    let active_activities = model.get_display_activities();
+    let (scroll_handle, active_activities) = match scroll {
+        Some(s) => (s.handle, s.display_activities),
+        None => (None, model.get_display_activities(ui_state)),
+    };
 
     let summary = model.calculate_summary();
-    let selected_id = ui_state.selected_activity;
     let terminal_size = ui_state.terminal_size;
 
-    // Check if we have a selected activity with logs/details
+    let selected_id = ui_state
+        .selected_activity
+        .filter(|id| active_activities.iter().any(|da| da.activity.id == *id));
     let selected_activity = selected_id.and_then(|id| model.get_activity(id));
     let selected_logs = selected_activity
         .as_ref()
@@ -60,17 +84,22 @@ pub fn view(
                 NixActivityState::Completed { success: false, .. }
             )
         );
-        let activity_logs = if let ActivityVariant::Task(ref task_data) = activity.variant
-            && (task_data.show_output || task_failed)
-        {
-            model.get_build_logs(activity.id).cloned()
-        } else if devenv_failed {
-            model.get_build_logs(activity.id).cloned()
-        } else if matches!(activity.variant, ActivityVariant::Process(_)) {
-            model.get_build_logs(activity.id).cloned()
-        } else if let ActivityVariant::Message(ref msg_data) = activity.variant
-            && msg_data.details.is_some()
-        {
+        let evaluate_failed = matches!(
+            (&activity.variant, &activity.state),
+            (
+                ActivityVariant::Evaluating(_),
+                NixActivityState::Completed { success: false, .. }
+            )
+        );
+        let show_activity_logs = devenv_failed
+            || evaluate_failed
+            || match &activity.variant {
+                ActivityVariant::Task(task_data) => task_data.show_output || task_failed,
+                ActivityVariant::Process(_) => true,
+                ActivityVariant::Message(msg_data) => msg_data.details.is_some(),
+                _ => false,
+            };
+        let activity_logs = if show_activity_logs {
             model.get_build_logs(activity.id).cloned()
         } else if is_selected {
             selected_logs.cloned()
@@ -86,6 +115,12 @@ pub fn view(
             } => (Some(*success), *cached),
         };
 
+        let hidden_children_count = if matches!(activity.variant, ActivityVariant::Devenv) {
+            model.count_hidden_process_children(activity.id, ui_state)
+        } else {
+            0
+        };
+
         activity_elements.push(
             element! {
                 ContextProvider(value: Context::owned(ActivityRenderContext {
@@ -96,6 +131,9 @@ pub fn view(
                     log_line_count: model.get_log_line_count(activity.id),
                     completed,
                     cached,
+                    render_context,
+                    shutting_down,
+                    hidden_children_count,
                 })) {
                     ActivityItem
                 }
@@ -105,7 +143,7 @@ pub fn view(
     }
 
     // Determine if navigation is possible
-    let selectable_ids = model.get_selectable_activity_ids();
+    let selectable_ids = model.get_selectable_activity_ids(ui_state);
     let (can_go_up, can_go_down) = if let Some(current_id) = selected_id {
         if let Some(pos) = selectable_ids.iter().position(|&id| id == current_id) {
             (pos > 0, pos + 1 < selectable_ids.len())
@@ -126,28 +164,48 @@ pub fn view(
             showing_logs: selected_logs.is_some(),
             can_go_up,
             can_go_down,
+            interrupt_prompt_active: ui_state.interrupt_prompt_active(),
+            hide_stopped_processes: ui_state.hide_stopped_processes,
         })) {
             SummaryView
         }
     }
     .into_any();
 
+    // Build the activity list element
+    let activity_list = element! {
+        View(flex_direction: FlexDirection::Column, width: 100pct) {
+            #(activity_elements)
+        }
+    }
+    .into_any();
+
     let mut children = vec![];
 
-    // Task activities are now included in the regular activity list
-    // No separate task bar needed
-
-    // Activity list (with inline logs)
-    children.push(
-        element! {
-            View(flex_grow: 1.0, width: 100pct) {
-                View(flex_direction: FlexDirection::Column, width: 100pct) {
-                    #(activity_elements)
+    // Activity list: wrap in ScrollView for Normal render with scroll_handle,
+    // use plain layout for Final render
+    if let Some(handle) = scroll_handle {
+        let scroll_height = terminal_size.height.saturating_sub(SUMMARY_BAR_HEIGHT) as u32;
+        children.push(
+            element! {
+                View(height: scroll_height) {
+                    ScrollView(auto_scroll: true, keyboard_scroll: false, handle: handle) {
+                        #(activity_list)
+                    }
                 }
             }
-        }
-        .into_any(),
-    );
+            .into_any(),
+        );
+    } else {
+        children.push(
+            element! {
+                View(flex_grow: 1.0, width: 100pct) {
+                    #(activity_list)
+                }
+            }
+            .into_any(),
+        );
+    }
 
     // Summary line at bottom (only in normal render context)
     if show_summary {
@@ -169,7 +227,13 @@ pub fn view(
 
     element! {
         ContextProvider(value: Context::owned(terminal_size)) {
-            View(flex_direction: FlexDirection::Column, max_height: terminal_size.height as u32, width: 100pct, overflow: Overflow::Hidden, justify_content: JustifyContent::FlexEnd) {
+            View(
+                flex_direction: FlexDirection::Column,
+                max_height: terminal_size.height as u32,
+                width: 100pct,
+                overflow: Overflow::Hidden,
+                justify_content: JustifyContent::FlexEnd,
+            ) {
                 #(children)
             }
         }
@@ -189,17 +253,27 @@ struct ActivityRenderContext {
     completed: Option<bool>,
     /// Whether this activity's result was cached
     cached: bool,
+    /// Whether this is the final render before exit
+    render_context: RenderContext,
+    /// Whether the application is shutting down (Ctrl-C pressed)
+    shutting_down: bool,
+    /// Number of direct children hidden by the `hide_stopped_processes` filter.
+    hidden_children_count: usize,
 }
 
 /// Helper to build activity prefix with hierarchy and status indicator.
 /// - Top-level (depth == 0): [StatusIndicator]
 /// - Nested (depth > 0): [HierarchyPrefix][StatusIndicator]
-fn build_activity_prefix(depth: usize, completed: Option<bool>) -> Vec<AnyElement<'static>> {
+fn build_activity_prefix(
+    depth: usize,
+    completed: Option<bool>,
+    show_spinner: bool,
+) -> Vec<AnyElement<'static>> {
     let mut prefix = HierarchyPrefixComponent::new(depth).render();
 
     prefix.push(
         element!(View(margin_right: 1) {
-            StatusIndicator(completed: completed, show_spinner: true)
+            StatusIndicator(completed: completed, show_spinner: show_spinner)
         })
         .into_any(),
     );
@@ -209,9 +283,19 @@ fn build_activity_prefix(depth: usize, completed: Option<bool>) -> Vec<AnyElemen
 
 /// Render a single activity (owned version)
 #[component]
-fn ActivityItem(hooks: Hooks) -> impl Into<AnyElement<'static>> {
+fn ActivityItem(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
     let terminal_width = hooks.use_context::<TerminalSize>().width;
     let ctx = hooks.use_context::<ActivityRenderContext>();
+
+    // Measure rendered height and report it to the shared heights map.
+    // Copy the iocraft Ref (which is Copy) out of the cell::Ref so we can call write().
+    let heights = hooks.try_use_context::<ActivityHeights>().map(|r| *r);
+    let rect = hooks.use_component_rect();
+    if let (Some(mut heights), Some(rect)) = (heights, rect) {
+        let height = rect.bottom.saturating_sub(rect.top);
+        heights.write().insert(ctx.activity.id, height);
+    }
+
     let ActivityRenderContext {
         activity,
         depth,
@@ -220,6 +304,9 @@ fn ActivityItem(hooks: Hooks) -> impl Into<AnyElement<'static>> {
         log_line_count,
         completed,
         cached,
+        render_context,
+        shutting_down,
+        hidden_children_count,
     } = &*ctx;
 
     // Calculate elapsed time - use stored duration for completed activities, skip for queued
@@ -253,7 +340,7 @@ fn ActivityItem(hooks: Hooks) -> impl Into<AnyElement<'static>> {
 
             // For selected build activities, use custom multi-line rendering
             if *is_selected {
-                let prefix = build_activity_prefix(*depth, *completed);
+                let prefix = build_activity_prefix(*depth, *completed, true);
 
                 let main_line = ActivityTextComponent::new(
                     "building".to_string(),
@@ -267,12 +354,12 @@ fn ActivityItem(hooks: Hooks) -> impl Into<AnyElement<'static>> {
                 .render(terminal_width, *depth, prefix);
 
                 return ExpandedContentComponent::new(logs.as_deref())
-                    .with_empty_message("  → no build logs yet (press '^e' to expand)")
+                    .with_empty_message("  → no build logs yet (press Ctrl-E to expand)")
                     .render_with_main_line(main_line);
             }
 
             // Non-selected build activities use normal rendering
-            let prefix = build_activity_prefix(*depth, *completed);
+            let prefix = build_activity_prefix(*depth, *completed, true);
 
             return ActivityTextComponent::new(
                 "building".to_string(),
@@ -323,7 +410,7 @@ fn ActivityItem(hooks: Hooks) -> impl Into<AnyElement<'static>> {
                     base_status
                 };
 
-            let prefix = build_activity_prefix(*depth, *completed);
+            let prefix = build_activity_prefix(*depth, *completed, true);
 
             let main_line = ActivityTextComponent::name_only(
                 activity.name.clone(),
@@ -380,7 +467,7 @@ fn ActivityItem(hooks: Hooks) -> impl Into<AnyElement<'static>> {
                             progress.current.unwrap_or(0).human_count_bytes()
                         )
                     });
-                    let prefix = build_activity_prefix(*depth, *completed);
+                    let prefix = build_activity_prefix(*depth, *completed, true);
 
                     return ActivityTextComponent::new(
                         "downloading".to_string(),
@@ -399,7 +486,7 @@ fn ActivityItem(hooks: Hooks) -> impl Into<AnyElement<'static>> {
                     .substituter
                     .as_ref()
                     .map(|s| format!("from {}", s));
-                let prefix = build_activity_prefix(*depth, *completed);
+                let prefix = build_activity_prefix(*depth, *completed, true);
 
                 return ActivityTextComponent::new(
                     "downloading".to_string(),
@@ -414,7 +501,7 @@ fn ActivityItem(hooks: Hooks) -> impl Into<AnyElement<'static>> {
             }
         }
         ActivityVariant::Copy => {
-            let prefix = build_activity_prefix(*depth, *completed);
+            let prefix = build_activity_prefix(*depth, *completed, true);
 
             return ActivityTextComponent::new(
                 "copying".to_string(),
@@ -432,7 +519,7 @@ fn ActivityItem(hooks: Hooks) -> impl Into<AnyElement<'static>> {
                 .substituter
                 .as_ref()
                 .map(|s| format!("from {}", s));
-            let prefix = build_activity_prefix(*depth, *completed);
+            let prefix = build_activity_prefix(*depth, *completed, true);
 
             return ActivityTextComponent::new(
                 "querying".to_string(),
@@ -446,7 +533,7 @@ fn ActivityItem(hooks: Hooks) -> impl Into<AnyElement<'static>> {
             .render(terminal_width, *depth, prefix);
         }
         ActivityVariant::FetchTree => {
-            let prefix = build_activity_prefix(*depth, *completed);
+            let prefix = build_activity_prefix(*depth, *completed, true);
 
             return ActivityTextComponent::new(
                 "fetching".to_string(),
@@ -468,28 +555,9 @@ fn ActivityItem(hooks: Hooks) -> impl Into<AnyElement<'static>> {
                 activity.detail.clone()
             };
 
-            // For selected evaluation activities, show expandable file list
-            if *is_selected && logs.is_some() {
-                let prefix = build_activity_prefix(*depth, *completed);
+            let prefix = build_activity_prefix(*depth, *completed, true);
 
-                let main_line = ActivityTextComponent::name_only(
-                    activity.name.clone(),
-                    elapsed_str,
-                    activity.variant.clone(),
-                )
-                .with_suffix(suffix)
-                .with_completed(completed.is_some())
-                .with_selection(*is_selected)
-                .render(terminal_width, *depth, prefix);
-
-                return ExpandedContentComponent::new(logs.as_deref())
-                    .with_empty_message("  → no files evaluated yet (press '^e' to expand)")
-                    .render_with_main_line(main_line);
-            }
-
-            let prefix = build_activity_prefix(*depth, *completed);
-
-            return ActivityTextComponent::name_only(
+            let main_line = ActivityTextComponent::name_only(
                 activity.name.clone(),
                 elapsed_str,
                 activity.variant.clone(),
@@ -498,9 +566,22 @@ fn ActivityItem(hooks: Hooks) -> impl Into<AnyElement<'static>> {
             .with_completed(completed.is_some())
             .with_selection(*is_selected)
             .render(terminal_width, *depth, prefix);
+
+            // Show logs when selected or when failed (so error details are visible)
+            let failed = *completed == Some(false);
+            if (failed || *is_selected) && logs.is_some() {
+                let mut component = ExpandedContentComponent::new(logs.as_deref())
+                    .with_empty_message("  → no files evaluated yet (press Ctrl-E to expand)");
+                if failed {
+                    component = component.with_max_lines(LOG_VIEWPORT_FAILED);
+                }
+                return component.render_with_main_line(main_line);
+            }
+
+            return main_line;
         }
         ActivityVariant::UserOperation => {
-            let prefix = build_activity_prefix(*depth, *completed);
+            let prefix = build_activity_prefix(*depth, *completed, true);
 
             return ActivityTextComponent::name_only(
                 activity.name.clone(),
@@ -512,10 +593,10 @@ fn ActivityItem(hooks: Hooks) -> impl Into<AnyElement<'static>> {
             .render(terminal_width, *depth, prefix);
         }
         ActivityVariant::Devenv => {
-            let prefix = build_activity_prefix(*depth, *completed);
+            let prefix = build_activity_prefix(*depth, *completed, true);
 
             // Show line count as suffix when active or failed with logs
-            let suffix = if *completed == Some(true) {
+            let base_suffix = if *completed == Some(true) {
                 // Success - no suffix needed
                 None
             } else if let Some(ref progress) = activity.progress {
@@ -539,6 +620,16 @@ fn ActivityItem(hooks: Hooks) -> impl Into<AnyElement<'static>> {
                 Some(format!("{} lines", log_line_count))
             } else {
                 None
+            };
+
+            let suffix = if *hidden_children_count > 0 {
+                let hidden_note = format!("({} hidden)", hidden_children_count);
+                Some(match base_suffix {
+                    Some(s) => format!("{} {}", s, hidden_note),
+                    None => hidden_note,
+                })
+            } else {
+                base_suffix
             };
 
             let main_line = ActivityTextComponent::name_only(
@@ -565,12 +656,26 @@ fn ActivityItem(hooks: Hooks) -> impl Into<AnyElement<'static>> {
             return main_line;
         }
         ActivityVariant::Process(process_data) => {
+            let is_active = process_data.status.is_active();
+
             // Build status text with optional ports
-            let status_str = match process_data.status {
-                ProcessStatus::Running => "running",
-                ProcessStatus::Ready => "ready",
-                ProcessStatus::Restarting => "restarting",
-                ProcessStatus::Stopped => "stopped",
+            let status_str: std::borrow::Cow<str> = match &process_data.status {
+                _ if *shutting_down && is_active => "stopping".into(),
+                ProcessStatus::NotStarted => "auto start off".into(),
+                ProcessStatus::Waiting => "waiting".into(),
+                ProcessStatus::Starting => "starting".into(),
+                ProcessStatus::Running => {
+                    if let Some(probe) = &process_data.ready_probe {
+                        format!("running (not ready: {})", probe).into()
+                    } else {
+                        "running".into()
+                    }
+                }
+                ProcessStatus::Ready => "ready".into(),
+                ProcessStatus::Restarting => "restarting".into(),
+                ProcessStatus::Stopping => "stopping".into(),
+                ProcessStatus::Stopped if *completed == Some(false) => "failed".into(),
+                ProcessStatus::Stopped => "stopped".into(),
             };
 
             // Format ports: extract just the port numbers for brevity
@@ -595,12 +700,24 @@ fn ActivityItem(hooks: Hooks) -> impl Into<AnyElement<'static>> {
 
             let status_text = Some(format!("{}{}", status_str, ports_suffix));
 
-            let prefix = build_activity_prefix(*depth, *completed);
+            // Process prefix: spinner when running, no indicator when stopped
+            // but not yet completed, checkmark/X when completed.
+            let show_spinner = completed.is_none() && is_active;
+            let prefix = build_activity_prefix(*depth, *completed, show_spinner);
+
+            // Hide elapsed time for not-started/stopped processes
+            let process_elapsed = if matches!(process_data.status, ProcessStatus::NotStarted)
+                || (!is_active && completed.is_none())
+            {
+                String::new()
+            } else {
+                elapsed_str
+            };
 
             let main_line = ActivityTextComponent::new(
                 "".to_string(),
                 activity.name.clone(),
-                elapsed_str,
+                process_elapsed,
                 activity.variant.clone(),
             )
             .with_suffix(status_text)
@@ -614,7 +731,7 @@ fn ActivityItem(hooks: Hooks) -> impl Into<AnyElement<'static>> {
                 let mut component = ExpandedContentComponent::new(logs.as_deref())
                     .with_depth(*depth)
                     .with_empty_message("→ no output yet (press 'e' to expand)");
-                if process_failed {
+                if process_failed && *render_context == RenderContext::Final {
                     component = component.with_max_lines(LOG_VIEWPORT_FAILED);
                 } else if !is_selected {
                     component = component.with_max_lines(LOG_VIEWPORT_SHOW_OUTPUT);
@@ -779,7 +896,7 @@ fn ActivityItem(hooks: Hooks) -> impl Into<AnyElement<'static>> {
             }
         }
         ActivityVariant::Unknown => {
-            let prefix = build_activity_prefix(*depth, *completed);
+            let prefix = build_activity_prefix(*depth, *completed, true);
 
             return ActivityTextComponent::new(
                 "unknown".to_string(),
@@ -802,6 +919,8 @@ struct SummaryViewContext {
     showing_logs: bool,
     can_go_up: bool,
     can_go_down: bool,
+    interrupt_prompt_active: bool,
+    hide_stopped_processes: bool,
 }
 
 /// Summary view component that adapts to terminal width
@@ -809,33 +928,54 @@ struct SummaryViewContext {
 fn SummaryView(hooks: Hooks) -> impl Into<AnyElement<'static>> {
     let terminal_width = hooks.use_context::<TerminalSize>().width;
     let ctx = hooks.use_context::<SummaryViewContext>();
+    build_summary_view_impl(&ctx, terminal_width)
+}
+
+/// Build the summary view with colored counts
+fn build_summary_view_impl(ctx: &SummaryViewContext, terminal_width: u16) -> AnyElement<'static> {
     let SummaryViewContext {
         summary,
         selected,
         showing_logs,
         can_go_up,
         can_go_down,
-    } = &*ctx;
+        interrupt_prompt_active,
+        hide_stopped_processes,
+    } = ctx;
+    let selected = selected.as_ref();
+    let showing_logs = *showing_logs;
+    let can_go_up = *can_go_up;
+    let can_go_down = *can_go_down;
+    let interrupt_prompt_active = *interrupt_prompt_active;
+    let hide_stopped_processes = *hide_stopped_processes;
 
-    build_summary_view_impl(
-        summary,
-        selected.as_ref(),
-        *showing_logs,
-        *can_go_up,
-        *can_go_down,
-        terminal_width,
-    )
-}
+    if interrupt_prompt_active {
+        let prompt_text = if terminal_width < 72 {
+            "Quit devenv? Nothing stopped."
+        } else {
+            "Quit devenv? Nothing has been stopped yet."
+        };
 
-/// Build the summary view with colored counts
-fn build_summary_view_impl(
-    summary: &ActivitySummary,
-    selected: Option<&Activity>,
-    showing_logs: bool,
-    can_go_up: bool,
-    can_go_down: bool,
-    terminal_width: u16,
-) -> AnyElement<'static> {
+        return element!(View(
+            flex_direction: FlexDirection::Row,
+            justify_content: JustifyContent::SpaceBetween,
+            width: 100pct
+        ) {
+            View(flex_grow: 1.0, min_width: 0, overflow: Overflow::Hidden) {
+                Text(content: prompt_text, color: Color::Yellow, weight: Weight::Bold)
+            }
+            View(flex_direction: FlexDirection::Row, flex_shrink: 0.0, margin_left: 2) {
+                Text(content: "c", color: COLOR_INTERACTIVE)
+                Text(content: " keep running • ")
+                Text(content: "q", color: COLOR_INTERACTIVE)
+                Text(content: " quit • ")
+                Text(content: "Ctrl-C", color: COLOR_INTERACTIVE)
+                Text(content: " quit")
+            }
+        })
+        .into_any();
+    }
+
     let mut children = vec![];
     let mut has_content = false;
 
@@ -843,6 +983,10 @@ fn build_summary_view_impl(
     let has_selection = selected.is_some();
     let is_process =
         matches!(selected, Some(a) if matches!(a.variant, ActivityVariant::Process(_)));
+    let is_stoppable = matches!(
+        selected,
+        Some(a) if matches!(&a.variant, ActivityVariant::Process(p) if p.status.is_stoppable())
+    );
 
     // Determine display mode based on terminal width
     let use_symbols = terminal_width < 60; // Use unicode symbols for very narrow terminals
@@ -1004,21 +1148,39 @@ fn build_summary_view_impl(
         has_content = true;
     }
 
-    // Processes - show if there are any running
-    if summary.running_processes > 0 {
+    // Processes - show if there are any tracked (running or stopped)
+    if summary.total_processes > 0 {
         if has_content {
             children.push(element!(View(margin_left: if use_symbols { 1 } else { 2 }, margin_right: if use_symbols { 1 } else { 2 }, flex_shrink: 0.0) {
                 Text(content: "│", color: COLOR_HIERARCHY)
             }).into_any());
         }
 
-        children.push(element!(View(margin_right: 1, flex_shrink: 0.0) {
-            Text(content: format!("{}", summary.running_processes), color: COLOR_COMPLETED, weight: Weight::Bold)
-        }).into_any());
+        let running_all = summary.running_processes == summary.total_processes;
+        if running_all {
+            children.push(element!(View(margin_right: 1, flex_shrink: 0.0) {
+                Text(content: format!("{}", summary.total_processes), color: COLOR_COMPLETED, weight: Weight::Bold)
+            }).into_any());
+        } else if use_symbols {
+            children.push(element!(View(margin_right: 1, flex_direction: FlexDirection::Row, flex_shrink: 0.0) {
+                Text(content: format!("{}", summary.running_processes), color: COLOR_COMPLETED, weight: Weight::Bold)
+                Text(content: format!("/{}", summary.total_processes))
+            }).into_any());
+        } else {
+            children.push(element!(View(margin_right: 1, flex_shrink: 0.0) {
+                Text(content: format!("{}", summary.running_processes), color: COLOR_COMPLETED, weight: Weight::Bold)
+            }).into_any());
+            children.push(
+                element!(View(margin_right: 1, flex_shrink: 0.0) {
+                    Text(content: format!("of {}", summary.total_processes))
+                })
+                .into_any(),
+            );
+        }
 
         children.push(
             element!(View(flex_shrink: 0.0) {
-                Text(content: if summary.running_processes == 1 { "process" } else { "processes" })
+                Text(content: if summary.total_processes == 1 { "process" } else { "processes" })
             })
             .into_any(),
         );
@@ -1027,6 +1189,7 @@ fn build_summary_view_impl(
     // Build help text - always show, adapt based on terminal width
     let mut help_children = vec![];
     let use_short_text = terminal_width < 100; // Use shorter text for narrow terminals
+    let show_hide_toggle = summary.stopped_processes > 0 || hide_stopped_processes;
 
     let up_arrow_color = if can_go_up {
         COLOR_INTERACTIVE
@@ -1052,7 +1215,7 @@ fn build_summary_view_impl(
         } else {
             help_children.push(element!(Text(content: " • ")).into_any());
         }
-        help_children.push(element!(Text(content: "^e", color: COLOR_INTERACTIVE)).into_any());
+        help_children.push(element!(Text(content: if use_short_text { "^E" } else { "Ctrl-E" }, color: COLOR_INTERACTIVE)).into_any());
         if use_symbols {
             help_children.push(element!(Text(content: " ▼ • ")).into_any());
         } else if use_short_text {
@@ -1061,12 +1224,25 @@ fn build_summary_view_impl(
             help_children.push(element!(Text(content: " expand logs • ")).into_any());
         }
         if is_process {
-            help_children.push(element!(Text(content: "^r", color: COLOR_INTERACTIVE)).into_any());
-            if use_short_text {
-                help_children.push(element!(Text(content: " restart • ")).into_any());
-            } else {
-                help_children.push(element!(Text(content: " restart process • ")).into_any());
+            if is_stoppable {
+                help_children
+                    .push(element!(Text(content: if use_short_text { "^X" } else { "Ctrl-X" }, color: COLOR_INTERACTIVE)).into_any());
+                if use_short_text {
+                    help_children.push(element!(Text(content: " stop • ")).into_any());
+                } else {
+                    help_children.push(element!(Text(content: " stop process • ")).into_any());
+                }
             }
+            help_children.push(element!(Text(content: if use_short_text { "^R" } else { "Ctrl-R" }, color: COLOR_INTERACTIVE)).into_any());
+            if use_short_text {
+                help_children.push(element!(Text(content: " (re)start • ")).into_any());
+            } else {
+                help_children.push(element!(Text(content: " (re)start process • ")).into_any());
+            }
+        }
+        if show_hide_toggle {
+            help_children.push(element!(Text(content: if use_short_text { "^H" } else { "Ctrl-H" }, color: COLOR_INTERACTIVE)).into_any());
+            help_children.push(element!(Text(content: if hide_stopped_processes { " show stopped • " } else { " hide stopped • " })).into_any());
         }
         help_children.push(element!(Text(content: "Esc", color: COLOR_INTERACTIVE)).into_any());
         if showing_logs {
@@ -1082,15 +1258,22 @@ fn build_summary_view_impl(
             help_children.push(element!(Text(content: " clear")).into_any());
         }
     } else {
-        // Show navigate hint only when no selection (^e requires selection)
+        // Show navigate hint only when no selection (Ctrl-E requires selection)
         help_children.push(element!(Text(content: "↑", color: up_arrow_color)).into_any());
         help_children.push(element!(Text(content: "↓", color: down_arrow_color)).into_any());
+        let trail = if show_hide_toggle { " • " } else { "" };
         if !use_symbols {
             if use_short_text {
-                help_children.push(element!(Text(content: " nav")).into_any());
+                help_children.push(element!(Text(content: format!(" nav{trail}"))).into_any());
             } else {
-                help_children.push(element!(Text(content: " navigate")).into_any());
+                help_children.push(element!(Text(content: format!(" navigate{trail}"))).into_any());
             }
+        } else if show_hide_toggle {
+            help_children.push(element!(Text(content: " • ")).into_any());
+        }
+        if show_hide_toggle {
+            help_children.push(element!(Text(content: if use_short_text { "^H" } else { "Ctrl-H" }, color: COLOR_INTERACTIVE)).into_any());
+            help_children.push(element!(Text(content: if hide_stopped_processes { " show stopped" } else { " hide stopped" })).into_any());
         }
     }
 
@@ -1107,5 +1290,322 @@ fn build_summary_view_impl(
 
 /// Format a duration in a human-readable way
 pub fn format_duration(duration: Duration) -> String {
+    if cfg!(feature = "deterministic-tui") {
+        return "[TIME]".to_string();
+    }
     duration.human_duration().to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::ActivityModel;
+    use devenv_activity::{ActivityEvent, ActivityLevel, Operation, Process, Timestamp};
+
+    fn summary_ctx(
+        hide_stopped_processes: bool,
+        interrupt_prompt_active: bool,
+        stopped_processes: usize,
+    ) -> SummaryViewContext {
+        SummaryViewContext {
+            summary: ActivitySummary {
+                stopped_processes,
+                ..ActivitySummary::default()
+            },
+            selected: None,
+            showing_logs: false,
+            can_go_up: false,
+            can_go_down: false,
+            interrupt_prompt_active,
+            hide_stopped_processes,
+        }
+    }
+
+    #[test]
+    fn test_summary_interrupt_prompt_renders() {
+        let mut element = build_summary_view_impl(&summary_ctx(false, true, 0), 100);
+        let output = element.render(Some(100)).to_string();
+
+        assert!(output.contains("Quit devenv?"));
+        assert!(output.contains("stopped"));
+        assert!(output.contains("keep running"));
+        assert!(output.contains("quit"));
+    }
+
+    #[test]
+    fn test_summary_help_reflects_hide_stopped_processes_state() {
+        let hidden_output = build_summary_view_impl(&summary_ctx(true, false, 0), 100)
+            .render(Some(100))
+            .to_string();
+
+        assert!(hidden_output.contains("show stopped"));
+        assert!(!hidden_output.contains("hide stopped"));
+
+        let shown_output = build_summary_view_impl(&summary_ctx(false, false, 1), 100)
+            .render(Some(100))
+            .to_string();
+
+        assert!(shown_output.contains("hide stopped"));
+        assert!(!shown_output.contains("show stopped"));
+    }
+
+    #[test]
+    fn test_summary_help_omits_hide_toggle_when_no_stopped_processes() {
+        let output = build_summary_view_impl(&summary_ctx(false, false, 0), 100)
+            .render(Some(100))
+            .to_string();
+
+        assert!(!output.contains("hide stopped"));
+        assert!(!output.contains("show stopped"));
+        assert!(!output.contains("Ctrl-H"));
+    }
+
+    #[test]
+    fn test_view_uses_current_ui_state_for_process_visibility() {
+        let mut model = ActivityModel::default();
+        let mut ui_state = UiState::new();
+
+        model.apply_activity_event(ActivityEvent::Operation(Operation::Start {
+            id: 100,
+            name: "Running processes".to_string(),
+            parent: None,
+            detail: None,
+            level: ActivityLevel::Info,
+            timestamp: Timestamp::now(),
+        }));
+
+        model.apply_activity_event(ActivityEvent::Process(Process::Start {
+            id: 1,
+            name: "manually-stopped".to_string(),
+            parent: Some(100),
+            command: None,
+            ports: vec![],
+            ready_probe: None,
+            level: ActivityLevel::Info,
+            timestamp: Timestamp::now(),
+        }));
+        model.apply_activity_event(ActivityEvent::Process(Process::Status {
+            id: 1,
+            status: ProcessStatus::Stopped,
+            timestamp: Timestamp::now(),
+        }));
+
+        let stale_display = model.get_display_activities(&ui_state);
+        assert!(
+            stale_display
+                .iter()
+                .any(|da| da.activity.name == "manually-stopped")
+        );
+
+        ui_state.hide_stopped_processes = true;
+
+        let display_activities = model.get_display_activities(&ui_state);
+        let mut element: AnyElement<'static> = view(
+            &model,
+            &ui_state,
+            RenderContext::Normal,
+            Some(ScrollState {
+                handle: None,
+                display_activities,
+            }),
+            false,
+        )
+        .into();
+        let rendered = element
+            .render(Some(ui_state.terminal_size.width as usize))
+            .to_string();
+
+        assert!(!rendered.contains("manually-stopped"));
+    }
+
+    #[test]
+    fn test_running_processes_label_shows_hidden_count_when_filter_is_active() {
+        let mut model = ActivityModel::default();
+        let mut ui_state = UiState::new();
+
+        model.apply_activity_event(ActivityEvent::Operation(Operation::Start {
+            id: 100,
+            name: "Running processes".to_string(),
+            parent: None,
+            detail: None,
+            level: ActivityLevel::Info,
+            timestamp: Timestamp::now(),
+        }));
+
+        for (id, name) in [(1, "stopped-a"), (2, "stopped-b"), (3, "running")] {
+            model.apply_activity_event(ActivityEvent::Process(Process::Start {
+                id,
+                name: name.to_string(),
+                parent: Some(100),
+                command: None,
+                ports: vec![],
+                ready_probe: None,
+                level: ActivityLevel::Info,
+                timestamp: Timestamp::now(),
+            }));
+        }
+        for id in [1, 2] {
+            model.apply_activity_event(ActivityEvent::Process(Process::Status {
+                id,
+                status: ProcessStatus::Stopped,
+                timestamp: Timestamp::now(),
+            }));
+        }
+
+        let render = |ui: &UiState| {
+            let display_activities = model.get_display_activities(ui);
+            let mut element: AnyElement<'static> = view(
+                &model,
+                ui,
+                RenderContext::Normal,
+                Some(ScrollState {
+                    handle: None,
+                    display_activities,
+                }),
+                false,
+            )
+            .into();
+            element
+                .render(Some(ui.terminal_size.width as usize))
+                .to_string()
+        };
+
+        let rendered_visible = render(&ui_state);
+        assert!(
+            !rendered_visible.contains("hidden)"),
+            "no hidden count is shown while the filter is off: {rendered_visible}"
+        );
+
+        ui_state.hide_stopped_processes = true;
+        let rendered_hidden = render(&ui_state);
+        assert!(
+            rendered_hidden.contains("(2 hidden)"),
+            "hidden count should appear next to the Running processes label: {rendered_hidden}"
+        );
+    }
+
+    #[test]
+    fn test_summary_bar_shows_running_of_total_when_some_are_stopped() {
+        let mut model = ActivityModel::default();
+        let mut ui_state = UiState::new();
+        // Wide enough to fit stats + help without column truncation.
+        ui_state.set_terminal_size(120, 24);
+
+        model.apply_activity_event(ActivityEvent::Operation(Operation::Start {
+            id: 100,
+            name: "Running processes".to_string(),
+            parent: None,
+            detail: None,
+            level: ActivityLevel::Info,
+            timestamp: Timestamp::now(),
+        }));
+
+        for (id, name) in [(1, "stopped"), (2, "running-a"), (3, "running-b")] {
+            model.apply_activity_event(ActivityEvent::Process(Process::Start {
+                id,
+                name: name.to_string(),
+                parent: Some(100),
+                command: None,
+                ports: vec![],
+                ready_probe: None,
+                level: ActivityLevel::Info,
+                timestamp: Timestamp::now(),
+            }));
+        }
+        model.apply_activity_event(ActivityEvent::Process(Process::Status {
+            id: 1,
+            status: ProcessStatus::Stopped,
+            timestamp: Timestamp::now(),
+        }));
+
+        let display_activities = model.get_display_activities(&ui_state);
+        let mut element: AnyElement<'static> = view(
+            &model,
+            &ui_state,
+            RenderContext::Normal,
+            Some(ScrollState {
+                handle: None,
+                display_activities,
+            }),
+            false,
+        )
+        .into();
+        let rendered = element
+            .render(Some(ui_state.terminal_size.width as usize))
+            .to_string();
+
+        assert!(
+            rendered.contains("2 of 3"),
+            "summary bar must surface running-of-total when some are stopped: {rendered}"
+        );
+    }
+
+    #[test]
+    fn test_summary_bar_excludes_not_started_processes_from_total() {
+        let mut model = ActivityModel::default();
+        let mut ui_state = UiState::new();
+        ui_state.set_terminal_size(120, 24);
+
+        model.apply_activity_event(ActivityEvent::Operation(Operation::Start {
+            id: 100,
+            name: "Running processes".to_string(),
+            parent: None,
+            detail: None,
+            level: ActivityLevel::Info,
+            timestamp: Timestamp::now(),
+        }));
+
+        for (id, name) in [(1, "disabled-a"), (2, "disabled-b"), (3, "running")] {
+            model.apply_activity_event(ActivityEvent::Process(Process::Start {
+                id,
+                name: name.to_string(),
+                parent: Some(100),
+                command: None,
+                ports: vec![],
+                ready_probe: None,
+                level: ActivityLevel::Info,
+                timestamp: Timestamp::now(),
+            }));
+        }
+        for id in [1, 2] {
+            model.apply_activity_event(ActivityEvent::Process(Process::Status {
+                id,
+                status: ProcessStatus::NotStarted,
+                timestamp: Timestamp::now(),
+            }));
+        }
+
+        let summary = model.calculate_summary();
+        assert_eq!(summary.running_processes, 1);
+        assert_eq!(summary.stopped_processes, 0);
+        assert_eq!(
+            summary.total_processes, 1,
+            "NotStarted processes must not inflate the tracked total"
+        );
+
+        let display_activities = model.get_display_activities(&ui_state);
+        let mut element: AnyElement<'static> = view(
+            &model,
+            &ui_state,
+            RenderContext::Normal,
+            Some(ScrollState {
+                handle: None,
+                display_activities,
+            }),
+            false,
+        )
+        .into();
+        let rendered = element
+            .render(Some(ui_state.terminal_size.width as usize))
+            .to_string();
+
+        assert!(
+            !rendered.contains("of 1 processes") && !rendered.contains("0 of"),
+            "bar must render `1 process` not `0 of 1`: {rendered}"
+        );
+        assert!(
+            rendered.contains("1 process"),
+            "running count should still surface: {rendered}"
+        );
+    }
 }

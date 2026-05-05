@@ -13,10 +13,10 @@ pub use eval_inputs::{
 };
 
 pub use caching_eval::{
-    CacheError, CachedEval, CachedEvalResult, CachingEvalService, CachingEvalState,
+    CacheError, CachedEval, CachedEvalResult, CachingEvalService, CachingEvalState, Error,
     UncachedEvalState, UncachedReason,
 };
-pub use ffi_cache::{CachingConfig, EvalCacheKey, EvalInputCollector, ops_to_inputs};
+pub use ffi_cache::{CachingConfig, EvalCacheKey, InputTracker, ops_to_inputs};
 pub use resource_manager::{ResourceManager, ResourceSpec};
 
 // Re-export database query functions for file tracking

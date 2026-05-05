@@ -6,10 +6,22 @@ let
     map (name: path + "/${name}") (builtins.attrNames (builtins.readDir path));
 
   drvOrPackageToPaths = drvOrPackage:
-    if drvOrPackage ? outputs then
-      builtins.map (output: drvOrPackage.${output}) drvOrPackage.outputs
-    else
-      [ drvOrPackage ];
+    let
+      outputs =
+        if drvOrPackage ? outputs then
+          builtins.map (output: drvOrPackage.${output}) drvOrPackage.outputs
+        else
+          [ drvOrPackage ];
+      # Include transitive Python dependencies so they end up in the profile's
+      # site-packages. Without this, packages added via `packages = [ pkgs.python3Packages.foo ]`
+      # would be importable but their dependencies (propagatedBuildInputs) would not,
+      # since dontAddPythonPath prevents the setup hook from adding them to PYTHONPATH.
+      pythonDeps =
+        if drvOrPackage ? requiredPythonModules
+        then drvOrPackage.requiredPythonModules
+        else [ ];
+    in
+    outputs ++ pythonDeps;
 
   profile = pkgs.buildEnv {
     name = "devenv-profile";
@@ -105,7 +117,7 @@ in
           stdenv.override
             (prev: {
               extraBuildInputs =
-                builtins.filter (x: !lib.hasPrefix "apple-sdk" x.pname) prev.extraBuildInputs;
+                builtins.filter (x: !(x ? sdkroot)) prev.extraBuildInputs;
             })
         else stdenv;
 
@@ -216,7 +228,6 @@ in
       root = lib.mkOption {
         type = types.str;
         internal = true;
-        default = builtins.getEnv "PWD";
       };
 
       dotfile = lib.mkOption {
@@ -253,13 +264,6 @@ in
       tmpdir = lib.mkOption {
         type = types.str;
         internal = true;
-        # Used for TMPDIR override - should NOT use XDG_RUNTIME_DIR as that's
-        # a small tmpfs meant for runtime files (sockets), not build artifacts
-        default =
-          let
-            tmp = builtins.getEnv "TMPDIR";
-          in
-          if tmp != "" then tmp else "/tmp";
       };
 
       profile = lib.mkOption {
@@ -297,14 +301,6 @@ in
   config = {
     assertions = [
       {
-        assertion = config.devenv.root != "";
-        message = ''
-          devenv was not able to determine the current directory.
-
-          See https://devenv.sh/guides/using-with-flakes/ how to use it with flakes.
-        '';
-      }
-      {
         assertion = config.devenv.flakesIntegration || config.overlays == [ ] || (config.devenv.cli.version != null && lib.versionAtLeast config.devenv.cli.version "1.4.2");
         message = ''
           Using overlays requires devenv 1.4.2 or higher, while your current version is ${toString config.devenv.cli.version}.
@@ -312,7 +308,7 @@ in
       }
     ];
     # use builtins.toPath to normalize path if root is "/" (container)
-    devenv.state = builtins.toPath (config.devenv.dotfile + "/state");
+    devenv.state = lib.mkDefault (builtins.toPath (config.devenv.dotfile + "/state"));
     devenv.dotfile = lib.mkDefault (builtins.toPath (config.devenv.root + "/.devenv"));
     devenv.profile = profile;
 
@@ -329,11 +325,16 @@ in
     ++ lib.optional (config.apple.sdk != null) config.apple.sdk;
 
     enterShell = lib.mkBefore ''
-      export PS1="\[\e[0;34m\](devenv)\[\e[0m\] ''${PS1-}"
+      ${lib.optionalString (config.devenv.cli.version == null || !lib.versionAtLeast config.devenv.cli.version "2.1") ''
+        export PS1="\[\e[0;34m\](devenv)\[\e[0m\] ''${PS1-}"
+      ''}
 
-      # override temp directories after "nix develop"
+      # Override temp directories that stdenv set to NIX_BUILD_TOP.
+      # Only reset those that still point to the Nix build dir; leave
+      # any user/CI-supplied value intact so child processes (e.g.
+      # `devenv processes wait`) compute the same runtime directory.
       for var in TMP TMPDIR TEMP TEMPDIR; do
-        if [ -n "''${!var-}" ]; then
+        if [ -n "''${!var-}" ] && [ "''${!var}" = "''${NIX_BUILD_TOP-}" ]; then
           export "$var"=${config.devenv.tmpdir}
         fi
       done
@@ -369,17 +370,18 @@ in
       let
         # `mkShell` merges `packages` into `nativeBuildInputs`.
         # This distinction is generally not important for devShells, except when it comes to setup hooks and their run order.
-        # On macOS, the default apple-sdk is added to stdenv via `extraBuildInputs`.
-        # If we don't remove it from stdenv, then its setup hooks will clobber any SDK added to `packages`.
-        isAppleSDK = pkg: builtins.match ".*apple-sdk.*" (pkg.pname or "") != null;
-        partitionedPkgs = builtins.partition isAppleSDK config.packages;
-        buildInputs = partitionedPkgs.right;
-        nativeBuildInputs = partitionedPkgs.wrong;
+        # On macOS, route apple-sdk packages (identified by `passthru.sdkroot`) into `buildInputs`
+        # so they participate in the SDK version comparison done by stdenv's setup hooks.
+        partitioned =
+          if pkgs.stdenv.isDarwin
+          then builtins.partition (pkg: pkg ? sdkroot) config.packages
+          else { right = [ ]; wrong = config.packages; };
       in
       performAssertions (
         (pkgs.mkShell.override { stdenv = config.stdenv; }) ({
           inherit (config) hardeningDisable inputsFrom name;
-          inherit buildInputs nativeBuildInputs;
+          buildInputs = partitioned.right;
+          nativeBuildInputs = partitioned.wrong;
           shellHook = ''
             ${lib.optionalString config.devenv.debug "set -x"}
             ${config.enterShell}

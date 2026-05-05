@@ -5,6 +5,10 @@
 , options
 , ...
 }:
+
+let
+  inherit (pkgs.stdenv) system;
+in
 {
   env = {
     # The path to the eval cache database (for migrations)
@@ -21,22 +25,33 @@
   claude.code = {
     enable = true;
     commands = {
+      bump-nix = ''
+        Bump the nix input in both devenv.lock and flake.lock
+
+        1. Run `devenv update nix` and `nix flake update nix` in parallel
+        2. Commit the changes
+      '';
       release = ''
         Release devenv version $ARGUMENTS
 
         1. Update version in Cargo.toml to $ARGUMENTS using `cargo set-version`
         2. Run `cargo check` to update Cargo.lock
-        3. Generate release notes:
-           - Find the latest git tag
-           - Get the diff between that tag and HEAD
-           - Summarize changes into release notes format
-        4. Ask user for access to nixpkgs repository to bump devenv there
-           - The package is at pkgs/by-name/de/devenv/package.nix
-           - Sync with ./package.nix from this repo and bump version
+        3. Put today's date in CHANGELOG.md replacing "(unreleased)"
+        4. Create a new "## X.Y.Z (unreleased)" section above the released version in CHANGELOG.md
         5. If this is a major version bump (X.Y.0, not X.Y.Z patch):
            - Generate a blog post in docs/src/blog/posts/
            - Follow the naming convention: devenv-vX.Y-short-description.md
            - Use existing blog posts as reference for format and style
+        6. Commit the changes
+        7. Capture the release commit SHA with `git rev-parse HEAD`
+        8. Push the commit(s) to GitHub
+        9. Create a GitHub release with `gh release create v$ARGUMENTS --target <release-commit-sha> --title "v$ARGUMENTS" --latest --notes  "<changelog for this release>"`
+        10. Bump version to next patch with `cargo set-version --bump patch`
+        11. Run `devenv tasks run devenv:crate2nix` to regenerate Cargo.nix
+        12. Commit with message "Next release is <new version>"
+        13. Push to GitHub
+        14. At the end, tell the user that the package still needs to be bumped in nixpkgs:
+            - The package is at pkgs/by-name/de/devenv/package.nix
       '';
     };
     permissions = {
@@ -61,9 +76,9 @@
 
   # Project dependencies
   packages = [
-    inputs.nix.packages.${pkgs.stdenv.system}.nix # Required for integration tests
+    inputs.nix.packages.${system}.nix # Required for integration tests
     pkgs.git
-    pkgs.xorg.libxcb
+    pkgs.libxcb
     pkgs.yaml2json
     pkgs.tesh
     pkgs.watchexec
@@ -80,6 +95,8 @@
     pkgs.protobuf # snix
     pkgs.dbus # secretspec
     pkgs.nixd # LSP for devenv lsp command
+    inputs.crate2nix.packages.${system}.default # Generate Cargo.nix from Cargo.lock
+    inputs.ghostty.packages.${system}.libghostty-vt # pkg-config provider for libghostty-vt-sys
   ];
 
   languages = {
@@ -116,7 +133,14 @@
     '';
   };
 
+  tasks."devenv:crate2nix" = {
+    description = "Generate Cargo.nix from Cargo.lock";
+    exec = "crate2nix generate -h nix/crate-hashes.json";
+    execIfModified = [ "Cargo.lock" ];
+  };
+
   git-hooks.package = pkgs.prek;
+  git-hooks.excludes = [ "Cargo.nix" ];
   git-hooks.hooks = {
     nixpkgs-fmt.enable = true;
     rustfmt.enable = true;

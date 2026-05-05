@@ -1,7 +1,10 @@
-use avt::Vt;
+#![cfg(feature = "test-pty")]
+
+use devenv_shell::vt_utils::{DEFAULT_MAX_SCROLLBACK, active_point, row_plain_text, screen_point};
 use devenv_shell::{
     CommandBuilder, PtySize, SessionConfig, SessionIo, ShellCommand, ShellEvent, ShellSession,
 };
+use libghostty_vt::terminal::{Options as TerminalOptions, Terminal};
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
@@ -41,6 +44,9 @@ fn spawn_cmd(shell_line: &str) -> ShellCommand {
         watch_files: vec![],
     }
 }
+
+/// Floods 30 numbered lines followed by a DONE marker, overflowing a 24-row terminal.
+const FLOOD_CMD: &str = "for i in $(seq 1 30); do echo \"line$i\"; done; echo DONE; exit 0";
 
 /// Read from a UnixStream until `needle` is found or deadline expires.
 /// Returns all bytes read so far.
@@ -224,58 +230,56 @@ fn status_line_session() -> ShellSession {
 
 /// Render captured stdout through a virtual terminal and return visible viewport row texts.
 fn render(stdout_bytes: &[u8], cols: usize, rows: usize) -> Vec<String> {
-    let mut vt = Vt::new(cols, rows);
-    vt.feed_str(&String::from_utf8_lossy(stdout_bytes));
-    vt.view()
-        .iter()
-        .map(|line| line.text().trim_end().to_owned())
+    let mut vt = Terminal::new(TerminalOptions {
+        cols: cols as u16,
+        rows: rows as u16,
+        max_scrollback: 0,
+    })
+    .unwrap();
+    vt.vt_write(stdout_bytes);
+    (0..rows)
+        .map(|y| {
+            row_plain_text(&vt, active_point(y as u32))
+                .trim_end()
+                .to_owned()
+        })
         .collect()
 }
 
-/// Insta filters to normalize spinner in status line snapshots.
-fn status_line_filters() -> Vec<(&'static str, &'static str)> {
-    vec![(r"[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]", "[SPIN]")]
+/// Render captured stdout and return ALL lines (scrollback + viewport).
+/// Tests that scrolled-off content was correctly pushed into native scrollback.
+fn render_all_lines(stdout_bytes: &[u8], cols: usize, rows: usize) -> Vec<String> {
+    let mut vt = Terminal::new(TerminalOptions {
+        cols: cols as u16,
+        rows: rows as u16,
+        max_scrollback: DEFAULT_MAX_SCROLLBACK,
+    })
+    .unwrap();
+    vt.vt_write(stdout_bytes);
+    let total = vt.total_rows().unwrap_or(0);
+    (0..total)
+        .map(|y| {
+            row_plain_text(&vt, screen_point(y as u32))
+                .trim_end()
+                .to_owned()
+        })
+        .collect()
 }
 
-/// Replace timing values with [TIME] while preserving line width.
-///
-/// Duration text width varies with actual timing (e.g. "0ms" vs "10ms"),
-/// which changes iocraft's SpaceBetween gap. A simple regex filter would
-/// normalize the duration text but leave the gap different, causing flaky
-/// snapshots. This function compensates by adjusting the gap.
-fn filter_timing(line: &str) -> String {
-    let time_re = regex::Regex::new(r"\d+(?:m \d+|\.\d+)?(?:ms|s)").unwrap();
-    let gap_re = regex::Regex::new(r" {3,}").unwrap();
-
-    if let Some(tm) = time_re.find(line) {
-        let replacement = "[TIME]";
-        let width_delta = replacement.len() as isize - tm.as_str().len() as isize;
-        let replaced = format!(
-            "{}{}{}",
-            &line[..tm.start()],
-            replacement,
-            &line[tm.end()..]
-        );
-
-        // Adjust the right-alignment gap to compensate for the width change
-        if let Some(gm) = gap_re.find(&replaced) {
-            let new_gap = (gm.as_str().len() as isize - width_delta).max(2) as usize;
-            format!(
-                "{}{}{}",
-                &replaced[..gm.start()],
-                " ".repeat(new_gap),
-                &replaced[gm.end()..]
-            )
-        } else {
-            replaced
-        }
-    } else {
-        line.to_string()
-    }
+/// Normalize platform-specific keybind labels in status-line snapshots so a
+/// single `.snap` file works on Linux and macOS. On macOS the long form
+/// renders `Ctrl-Opt-E`/`Ctrl-Opt-D`; elsewhere it's `Ctrl-Alt-*`. The guard
+/// must be kept alive for the duration of the snapshot assertions.
+#[must_use]
+fn bind_keybind_filters() -> insta::internals::SettingsBindDropGuard {
+    let mut settings = insta::Settings::clone_current();
+    settings.add_filter(r"Ctrl-Opt-([A-Z])", "Ctrl-Alt-$1");
+    settings.bind_to_scope()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_status_line_rendered_on_last_row() {
+    let _keybind_guard = bind_keybind_filters();
     let (io, mut stdin_ours, mut stdout_ours) = test_io();
     let (cmd_tx, cmd_rx) = mpsc::channel(10);
     let (event_tx, _event_rx) = mpsc::channel(10);
@@ -307,24 +311,82 @@ async fn test_status_line_rendered_on_last_row() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_scroll_region_preserves_status_line() {
+async fn test_overflow_preserved_in_scrollback() {
     let (io, _stdin_ours, mut stdout_ours) = test_io();
+    let (cmd_tx, cmd_rx) = mpsc::channel(10);
+    let (event_tx, _event_rx) = mpsc::channel(10);
+
+    let session = test_session();
+    let handle = tokio::spawn(async move { session.run(cmd_rx, event_tx, None, io).await });
+
+    cmd_tx.send(spawn_cmd(FLOOD_CMD)).await.unwrap();
+
+    let collected = read_until(&mut stdout_ours, b"DONE", Duration::from_secs(5));
+
+    // All 30 lines must appear in scrollback + viewport — nothing lost
+    let all_lines = render_all_lines(&collected, 80, 24);
+    let non_empty: Vec<_> = all_lines
+        .iter()
+        .filter(|r| !r.is_empty())
+        .cloned()
+        .collect();
+    for i in 1..=30 {
+        let expected = format!("line{}", i);
+        assert!(
+            non_empty.iter().any(|l| l.contains(&expected)),
+            "expected '{}' in scrollback + viewport, but it was lost",
+            expected
+        );
+    }
+
+    let _ = handle.await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_overflow_viewport_shows_tail() {
+    let (io, _stdin_ours, mut stdout_ours) = test_io();
+    let (cmd_tx, cmd_rx) = mpsc::channel(10);
+    let (event_tx, _event_rx) = mpsc::channel(10);
+
+    let session = test_session();
+    let handle = tokio::spawn(async move { session.run(cmd_rx, event_tx, None, io).await });
+
+    cmd_tx.send(spawn_cmd(FLOOD_CMD)).await.unwrap();
+
+    let collected = read_until(&mut stdout_ours, b"DONE", Duration::from_secs(5));
+
+    let rows = render(&collected, 80, 24);
+    let non_empty: Vec<_> = rows.iter().filter(|r| !r.is_empty()).collect();
+    insta::assert_snapshot!(
+        non_empty
+            .iter()
+            .map(|s| s.as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+
+    let _ = handle.await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_overflow_status_line_protected() {
+    let _keybind_guard = bind_keybind_filters();
+    let (io, mut stdin_ours, mut stdout_ours) = test_io();
     let (cmd_tx, cmd_rx) = mpsc::channel(10);
     let (event_tx, _event_rx) = mpsc::channel(10);
 
     let session = status_line_session();
     let handle = tokio::spawn(async move { session.run(cmd_rx, event_tx, None, io).await });
 
-    // Spawn a shell that floods 30 lines (more than the 23-row scroll region),
-    // then prints a marker and exits
+    // Flood 30 lines then keep the process alive so the status line isn't
+    // cleared by the PtyExit handler.
     cmd_tx
         .send(spawn_cmd(
-            "for i in $(seq 1 30); do echo \"line$i\"; done; echo DONE; exit 0",
+            "for i in $(seq 1 30); do echo \"line$i\"; done; echo DONE; read unused",
         ))
         .await
         .unwrap();
 
-    // Tell the session about watched files so the status line has visible content
     cmd_tx
         .send(ShellCommand::WatchedFiles {
             files: vec!["test.nix".into()],
@@ -332,19 +394,32 @@ async fn test_scroll_region_preserves_status_line() {
         .await
         .unwrap();
 
-    // Wait for all output to arrive
-    let collected = read_until(&mut stdout_ours, b"DONE", Duration::from_secs(5));
+    // Wait for both the flood output and the status line render
+    let mut collected = read_until(&mut stdout_ours, b"DONE", Duration::from_secs(5));
+    if !collected
+        .windows(b"watching".len())
+        .any(|w| w == b"watching")
+    {
+        collected.extend(read_until(
+            &mut stdout_ours,
+            b"watching",
+            Duration::from_secs(5),
+        ));
+    }
+
     let rows = render(&collected, 80, 24);
+    insta::assert_snapshot!(rows[23]);
 
-    // Snapshot the full viewport — shell output should be in rows 0-22,
-    // status line should be on row 23 (protected by scroll region)
-    insta::assert_snapshot!(rows.join("\n"));
-
+    // Unblock the process so it can exit
+    let _ = stdin_ours.write_all(b"\n");
+    drop(stdin_ours);
+    drop(cmd_tx);
     let _ = handle.await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_build_lifecycle_status_line() {
+    let _keybind_guard = bind_keybind_filters();
     let (io, mut stdin_ours, mut stdout_ours) = test_io();
     let (cmd_tx, cmd_rx) = mpsc::channel(10);
     let (event_tx, _event_rx) = mpsc::channel(10);
@@ -375,9 +450,7 @@ async fn test_build_lifecycle_status_line() {
         Duration::from_secs(5),
     ));
     let rows = render(&all_bytes, 80, 24);
-    insta::with_settings!({ filters => status_line_filters() }, {
-        insta::assert_snapshot!("building", filter_timing(&rows[23]));
-    });
+    insta::assert_snapshot!("building", &rows[23]);
 
     // Reload ready state
     cmd_tx
@@ -392,9 +465,7 @@ async fn test_build_lifecycle_status_line() {
         Duration::from_secs(5),
     ));
     let rows = render(&all_bytes, 80, 24);
-    insta::with_settings!({ filters => status_line_filters() }, {
-        insta::assert_snapshot!("reload_ready", filter_timing(&rows[23]));
-    });
+    insta::assert_snapshot!("reload_ready", &rows[23]);
 
     let _ = stdin_ours.write_all(b"\n");
     drop(stdin_ours);
@@ -404,6 +475,7 @@ async fn test_build_lifecycle_status_line() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_build_failed_error_toggle() {
+    let _keybind_guard = bind_keybind_filters();
     let (io, mut stdin_ours, mut stdout_ours) = test_io();
     let (cmd_tx, cmd_rx) = mpsc::channel(10);
     let (event_tx, _event_rx) = mpsc::channel(10);
@@ -435,9 +507,7 @@ async fn test_build_failed_error_toggle() {
         Duration::from_secs(5),
     ));
     let rows = render(&all_bytes, 80, 24);
-    insta::with_settings!({ filters => status_line_filters() }, {
-        insta::assert_snapshot!("failed_status", rows[23]);
-    });
+    insta::assert_snapshot!("failed_status", &rows[23]);
 
     // Ctrl-Alt-E to show error
     stdin_ours.write_all(&[0x1b, 0x05]).unwrap();
@@ -452,9 +522,7 @@ async fn test_build_failed_error_toggle() {
     ));
     let rows = render(&all_bytes, 80, 24);
     // Snapshot the viewport showing the error text and updated status line
-    insta::with_settings!({ filters => status_line_filters() }, {
-        insta::assert_snapshot!("error_displayed", rows.join("\n"));
-    });
+    insta::assert_snapshot!("error_displayed", rows.join("\n"));
 
     let _ = stdin_ours.write_all(b"\n");
     drop(stdin_ours);
@@ -464,6 +532,7 @@ async fn test_build_failed_error_toggle() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_watching_paused_status_line() {
+    let _keybind_guard = bind_keybind_filters();
     let (io, mut stdin_ours, mut stdout_ours) = test_io();
     let (cmd_tx, cmd_rx) = mpsc::channel(10);
     let (event_tx, _event_rx) = mpsc::channel(10);

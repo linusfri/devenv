@@ -156,12 +156,18 @@ boolean
 
 
 *Default:*
-` false `
+
+```nix
+false
+```
 
 
 
 *Example:*
-` true `
+
+```nix
+true
+```
 
 *Declared by:*
  - [https://github\.com/cachix/devenv/blob/main/src/modules/languages/rust\.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/rust.nix)
@@ -180,7 +186,10 @@ one of “nixpkgs”, “stable”, “beta”, “nightly”
 
 
 *Default:*
-` "nixpkgs" `
+
+```nix
+"nixpkgs"
+```
 
 *Declared by:*
  - [https://github\.com/cachix/devenv/blob/main/src/modules/languages/rust\.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/rust.nix)
@@ -202,7 +211,102 @@ list of string
 
 
 *Default:*
-` [ "rustc" "cargo" "clippy" "rustfmt" "rust-analyzer" ] `
+
+```nix
+[ "rustc" "cargo" "clippy" "rustfmt" "rust-analyzer" ]
+```
+
+*Declared by:*
+ - [https://github\.com/cachix/devenv/blob/main/src/modules/languages/rust\.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/rust.nix)
+
+
+
+### languages\.rust\.cranelift\.enable
+
+
+
+Use [Cranelift](https://cranelift\.dev/) as the codegen backend for dev builds\.
+
+Cranelift compiles significantly faster than LLVM at the cost of less optimized output\.
+Requires the nightly channel\.
+
+
+
+*Type:*
+boolean
+
+
+
+*Default:*
+
+```nix
+false
+```
+
+*Declared by:*
+ - [https://github\.com/cachix/devenv/blob/main/src/modules/languages/rust\.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/rust.nix)
+
+
+
+### languages\.rust\.cranelift\.excludePackages
+
+
+
+List of crate names that should use the LLVM backend instead of Cranelift\.
+
+Generates per-package overrides in ` .cargo/config.toml `\.
+
+
+
+*Type:*
+list of string
+
+
+
+*Default:*
+
+```nix
+[ ]
+```
+
+
+
+*Example:*
+
+```nix
+[
+  "aws-lc-sys"
+  "aws-lc-rs"
+  "rustls"
+]
+```
+
+*Declared by:*
+ - [https://github\.com/cachix/devenv/blob/main/src/modules/languages/rust\.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/rust.nix)
+
+
+
+### languages\.rust\.cranelift\.forceBuildScriptsLlvm
+
+
+
+Force build scripts and proc macros to use the LLVM backend\.
+
+Some build scripts may not work with Cranelift\. Enable this to fall back to
+LLVM for build scripts while keeping Cranelift for regular code\.
+
+
+
+*Type:*
+boolean
+
+
+
+*Default:*
+
+```nix
+false
+```
 
 *Declared by:*
  - [https://github\.com/cachix/devenv/blob/main/src/modules/languages/rust\.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/rust.nix)
@@ -239,6 +343,33 @@ function that evaluates to a(n) function that evaluates to a(n) package
 
 
 
+### languages\.rust\.lld\.enable
+
+
+
+Use [lld](https://lld\.llvm\.org/) as the linker\.
+
+lld is LLVM’s linker and is the recommended fast linker for Darwin\.
+Works on both Linux and macOS\.
+
+
+
+*Type:*
+boolean
+
+
+
+*Default:*
+
+```nix
+false
+```
+
+*Declared by:*
+ - [https://github\.com/cachix/devenv/blob/main/src/modules/languages/rust\.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/rust.nix)
+
+
+
 ### languages\.rust\.lsp\.enable
 
 
@@ -253,12 +384,18 @@ boolean
 
 
 *Default:*
-` true `
+
+```nix
+true
+```
 
 
 
 *Example:*
-` true `
+
+```nix
+true
+```
 
 *Declared by:*
  - [https://github\.com/cachix/devenv/blob/main/src/modules/languages/rust\.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/rust.nix)
@@ -279,7 +416,11 @@ package
 
 
 *Default:*
-` pkgs.rust-analyzer `
+Depends on the configured toolchain:
+
+ - ` nixpkgs ` channel: ` pkgs.rust-analyzer `\.
+ - non-nixpkgs channel: the ` rust-analyzer ` component from the rust-overlay toolchain, with a fallback to ` pkgs.rust-analyzer ` if not present in the manifest\.
+ - ` toolchainFile `: the aggregated toolchain package derived from the file\.
 
 *Declared by:*
  - [https://github\.com/cachix/devenv/blob/main/src/modules/languages/rust\.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/rust.nix)
@@ -303,7 +444,10 @@ boolean
 
 
 *Default:*
-` false `
+
+```nix
+false
+```
 
 *Declared by:*
  - [https://github\.com/cachix/devenv/blob/main/src/modules/languages/rust\.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/rust.nix)
@@ -324,7 +468,10 @@ string
 
 
 *Default:*
-` "" `
+
+```nix
+""
+```
 
 *Declared by:*
  - [https://github\.com/cachix/devenv/blob/main/src/modules/languages/rust\.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/rust.nix)
@@ -346,7 +493,10 @@ list of string
 
 
 *Default:*
-` [ ] `
+
+```nix
+[ ]
+```
 
 *Declared by:*
  - [https://github\.com/cachix/devenv/blob/main/src/modules/languages/rust\.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/rust.nix)
@@ -367,7 +517,10 @@ open submodule of attribute set of package
 
 
 *Default:*
-` nixpkgs `
+
+```nix
+nixpkgs
+```
 
 *Declared by:*
  - [https://github\.com/cachix/devenv/blob/main/src/modules/languages/rust\.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/rust.nix)
@@ -388,7 +541,10 @@ null or package
 
 
 *Default:*
-` pkgs.cargo `
+
+```nix
+pkgs.cargo
+```
 
 *Declared by:*
  - [https://github\.com/cachix/devenv/blob/main/src/modules/languages/rust\.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/rust.nix)
@@ -409,7 +565,10 @@ null or package
 
 
 *Default:*
-` pkgs.clippy `
+
+```nix
+pkgs.clippy
+```
 
 *Declared by:*
  - [https://github\.com/cachix/devenv/blob/main/src/modules/languages/rust\.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/rust.nix)
@@ -430,7 +589,10 @@ null or package
 
 
 *Default:*
-` pkgs.rust-analyzer `
+
+```nix
+pkgs.rust-analyzer
+```
 
 *Declared by:*
  - [https://github\.com/cachix/devenv/blob/main/src/modules/languages/rust\.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/rust.nix)
@@ -451,7 +613,10 @@ null or package
 
 
 *Default:*
-` pkgs.rustc `
+
+```nix
+pkgs.rustc
+```
 
 *Declared by:*
  - [https://github\.com/cachix/devenv/blob/main/src/modules/languages/rust\.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/rust.nix)
@@ -472,7 +637,10 @@ null or package
 
 
 *Default:*
-` pkgs.rustfmt `
+
+```nix
+pkgs.rustfmt
+```
 
 *Declared by:*
  - [https://github\.com/cachix/devenv/blob/main/src/modules/languages/rust\.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/rust.nix)
@@ -507,12 +675,18 @@ null or absolute path
 
 
 *Default:*
-` null `
+
+```nix
+null
+```
 
 
 
 *Example:*
-` ./rust-toolchain.toml `
+
+```nix
+./rust-toolchain.toml
+```
 
 *Declared by:*
  - [https://github\.com/cachix/devenv/blob/main/src/modules/languages/rust\.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/rust.nix)
@@ -551,7 +725,36 @@ string
 
 
 *Default:*
-` "latest" `
+
+```nix
+"latest"
+```
+
+*Declared by:*
+ - [https://github\.com/cachix/devenv/blob/main/src/modules/languages/rust\.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/rust.nix)
+
+
+
+### languages\.rust\.wild\.enable
+
+
+
+Use [wild](https://github\.com/wild-linker/wild) as the linker\.
+
+wild is a very fast linker for Linux\.
+
+
+
+*Type:*
+boolean
+
+
+
+*Default:*
+
+```nix
+false
+```
 
 *Declared by:*
  - [https://github\.com/cachix/devenv/blob/main/src/modules/languages/rust\.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/rust.nix)

@@ -3,12 +3,12 @@
 //! This module provides integration with nixd to enable IDE features like
 //! autocomplete, hover documentation, and go-to-definition for devenv.nix files.
 
+use devenv_activity::{ActivityLevel, message};
 use miette::{IntoDiagnostic, Result};
 use serde::Serialize;
 use std::collections::HashMap;
 use std::os::unix::process::CommandExt;
 use std::process::Command;
-use tracing::info;
 
 use crate::Devenv;
 
@@ -36,9 +36,7 @@ struct OptionEntry {
 
 /// Run the LSP server
 pub async fn run(devenv: &Devenv, print_config: bool) -> Result<()> {
-    // Assemble and get the serialized NixArgs
-    let nix_args = devenv.assemble(false).await?;
-
+    let nix_args = devenv.bootstrap_args().as_str();
     let bootstrap_path = devenv.dotfile().join("bootstrap");
 
     // Expression that imports default.nix with proper args and accesses .project.options
@@ -81,10 +79,7 @@ pub async fn run(devenv: &Devenv, print_config: bool) -> Result<()> {
     // nixd accepts --config for initial configuration as a JSON string
     let config_str = serde_json::to_string(&config).into_diagnostic()?;
 
-    info!(
-        devenv.is_user_message = true,
-        "Starting nixd language server"
-    );
+    message(ActivityLevel::Info, "Starting nixd language server");
 
     // Use exec() to replace the current process with nixd
     // This ensures proper stdio handling for LSP communication

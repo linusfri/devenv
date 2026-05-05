@@ -8,8 +8,10 @@ let
   cfg = config.languages.javascript;
 
   nodeModulesPath = "${
-    lib.optionalString (cfg.directory != config.devenv.root) ''"${cfg.directory}/"''
+    lib.optionalString (cfg.directory != config.devenv.root) "${cfg.directory}/"
   }node_modules";
+
+  dirPrefix = lib.optionalString (cfg.directory != config.devenv.root) "${cfg.directory}/";
 
   initNpmScript = pkgs.writeShellScript "init-npm.sh" ''
     function _devenv-npm-install()
@@ -17,9 +19,7 @@ let
       # Avoid running "npm install" for every shell.
       # Only run it when the "package-lock.json" file or nodejs version has changed.
       # We do this by storing the nodejs version and a hash of "package-lock.json" in node_modules.
-      local ACTUAL_NPM_CHECKSUM="${cfg.npm.package.version}:$(${pkgs.nix}/bin/nix-hash --type sha256 ${
-        lib.optionalString (cfg.directory != config.devenv.root) ''"${cfg.directory}/"''
-      }package-lock.json)"
+      local ACTUAL_NPM_CHECKSUM="${cfg.npm.package.version}:${config.lib._fileChecksum "${dirPrefix}package-lock.json"}"
       local NPM_CHECKSUM_FILE="${nodeModulesPath}/package-lock.json.checksum"
       if [ -f "$NPM_CHECKSUM_FILE" ]
         then
@@ -41,14 +41,12 @@ let
       fi
     }
 
-    if [ ! -f ${
-      lib.optionalString (cfg.directory != config.devenv.root) ''"${cfg.directory}/"''
-    }package.json ]
+    if [ ! -f "${dirPrefix}package.json" ]
     then
       echo "No package.json found${
-        lib.optionalString (cfg.directory != config.devenv.root) ''"in ${cfg.directory}"''
+        lib.optionalString (cfg.directory != config.devenv.root) " in ${cfg.directory}"
       }. Run '${
-        lib.optionalString (cfg.directory != config.devenv.root) ''"cd ${cfg.directory}/ && "''
+        lib.optionalString (cfg.directory != config.devenv.root) "cd ${cfg.directory}/ && "
       }npm init' to create one." >&2
     else
       _devenv-npm-install
@@ -61,9 +59,7 @@ let
       # Avoid running "pnpm install" for every shell.
       # Only run it when the "package-lock.json" file or nodejs version has changed.
       # We do this by storing the nodejs version and a hash of "package-lock.json" in node_modules.
-      local ACTUAL_PNPM_CHECKSUM="${cfg.pnpm.package.version}:$(${pkgs.nix}/bin/nix-hash --type sha256 ${
-        lib.optionalString (cfg.directory != config.devenv.root) ''"${cfg.directory}/"''
-      }pnpm-lock.yaml)"
+      local ACTUAL_PNPM_CHECKSUM="${cfg.pnpm.package.version}:${config.lib._fileChecksum "${dirPrefix}pnpm-lock.yaml"}"
       local PNPM_CHECKSUM_FILE="${nodeModulesPath}/pnpm-lock.yaml.checksum"
       if [ -f "$PNPM_CHECKSUM_FILE" ]
         then
@@ -85,14 +81,12 @@ let
       fi
     }
 
-    if [ ! -f ${
-      lib.optionalString (cfg.directory != config.devenv.root) ''"${cfg.directory}/"''
-    }package.json ]
+    if [ ! -f "${dirPrefix}package.json" ]
     then
       echo "No package.json found${
-        lib.optionalString (cfg.directory != config.devenv.root) ''"in ${cfg.directory}"''
+        lib.optionalString (cfg.directory != config.devenv.root) " in ${cfg.directory}"
       }. Run '${
-        lib.optionalString (cfg.directory != config.devenv.root) ''"cd ${cfg.directory}/ && "''
+        lib.optionalString (cfg.directory != config.devenv.root) "cd ${cfg.directory}/ && "
       }pnpm init' to create one." >&2
     else
       _devenv-pnpm-install
@@ -105,9 +99,7 @@ let
       # Avoid running "yarn install" for every shell.
       # Only run it when the "yarn.lock" file or nodejs version has changed.
       # We do this by storing the nodejs version and a hash of "yarn.lock" in node_modules.
-      local ACTUAL_YARN_CHECKSUM="${cfg.yarn.package.version}:$(${pkgs.nix}/bin/nix-hash --type sha256 ${
-        lib.optionalString (cfg.directory != config.devenv.root) ''"${cfg.directory}/"''
-      }yarn.lock)"
+      local ACTUAL_YARN_CHECKSUM="${cfg.yarn.package.version}:${config.lib._fileChecksum "${dirPrefix}yarn.lock"}"
       local YARN_CHECKSUM_FILE="${nodeModulesPath}/yarn.lock.checksum"
       if [ -f "$YARN_CHECKSUM_FILE" ]
         then
@@ -129,14 +121,12 @@ let
       fi
     }
 
-    if [ ! -f ${
-      lib.optionalString (cfg.directory != config.devenv.root) ''"${cfg.directory}/"''
-    }package.json ]
+    if [ ! -f "${dirPrefix}package.json" ]
     then
       echo "No package.json found${
-        lib.optionalString (cfg.directory != config.devenv.root) ''"in ${cfg.directory}"''
+        lib.optionalString (cfg.directory != config.devenv.root) " in ${cfg.directory}"
       }. Run '${
-        lib.optionalString (cfg.directory != config.devenv.root) ''"cd ${cfg.directory}/ && "''
+        lib.optionalString (cfg.directory != config.devenv.root) "cd ${cfg.directory}/ && "
       }yarn init' to create one." >&2
     else
       _devenv-yarn-install
@@ -150,9 +140,7 @@ let
       # Avoid running "bun install" for every shell.
       # Only run it when the "bun.lock" file or nodejs version has changed.
       # We do this by storing the nodejs version and a hash of "bun.lock" in node_modules.
-      local ACTUAL_BUN_CHECKSUM="${cfg.bun.package.version}:$(${pkgs.nix}/bin/nix-hash --type sha256 ${
-        lib.optionalString (cfg.directory != config.devenv.root) ''"${cfg.directory}/"''
-      }bun.lock)"
+      local ACTUAL_BUN_CHECKSUM="${cfg.bun.package.version}:${config.lib._fileChecksum "${dirPrefix}bun.lock"}"
       local BUN_CHECKSUM_FILE="${nodeModulesPath}/bun.lock.checksum"
       if [ -f "$BUN_CHECKSUM_FILE" ]
         then
@@ -187,9 +175,7 @@ let
       # Avoid running "bun install --yarn" for every shell.
       # Only run it when the "yarn.lock" file or nodejs version has changed.
       # We do this by storing the nodejs version and a hash of "yarn.lock" in node_modules.
-      local ACTUAL_BUN_CHECKSUM="${cfg.bun.package.version}:$(${pkgs.nix}/bin/nix-hash --type sha256 ${
-        lib.optionalString (cfg.directory != config.devenv.root) ''"${cfg.directory}/"''
-      }yarn.lock)"
+      local ACTUAL_BUN_CHECKSUM="${cfg.bun.package.version}:${config.lib._fileChecksum "${dirPrefix}yarn.lock"}"
       local BUN_CHECKSUM_FILE="${nodeModulesPath}/yarn.lock.checksum"
       if [ -f "$BUN_CHECKSUM_FILE" ]
         then
@@ -211,14 +197,12 @@ let
       fi
     }
 
-    if [ ! -f ${
-      lib.optionalString (cfg.directory != config.devenv.root) ''"${cfg.directory}/"''
-    }package.json ]
+    if [ ! -f "${dirPrefix}package.json" ]
     then
       echo "No package.json found${
-        lib.optionalString (cfg.directory != config.devenv.root) ''"in ${cfg.directory}"''
+        lib.optionalString (cfg.directory != config.devenv.root) " in ${cfg.directory}"
       }. Run '${
-        lib.optionalString (cfg.directory != config.devenv.root) ''"cd ${cfg.directory}/ && "''
+        lib.optionalString (cfg.directory != config.devenv.root) "cd ${cfg.directory}/ && "
       }bun init' to create one." >&2
     else
       ${
@@ -252,6 +236,10 @@ in
       description = "The Node.js package to use.";
     };
 
+    nodejs = {
+      enable = lib.mkEnableOption "Node.js runtime" // { default = true; };
+    };
+
     corepack = {
       enable = lib.mkEnableOption "wrappers for npm, pnpm and Yarn via Node.js Corepack";
     };
@@ -260,11 +248,16 @@ in
       enable = lib.mkEnableOption "install npm";
       package = lib.mkOption {
         type = lib.types.package;
-        default = cfg.package.override {
-          enableNpm = true;
-        };
+        default =
+          # nixpkgs 26.05+: nodejs-slim has an npm output
+          if builtins.elem "npm" (cfg.package.outputs or [ ])
+          then lib.getOutput "npm" cfg.package
+          # older nixpkgs: enableNpm override
+          else if cfg.package ? override && lib.functionArgs cfg.package.override ? enableNpm
+          then cfg.package.override { enableNpm = true; }
+          else cfg.package;
         defaultText = lib.literalExpression "languages.javascript.package";
-        description = "The Node.js package to use.";
+        description = "The npm package to use. Defaults to the npm output of the javascript package.";
       };
       install.enable = lib.mkEnableOption "npm install during devenv initialisation";
     };
@@ -273,10 +266,10 @@ in
       enable = lib.mkEnableOption "install pnpm";
       package = lib.mkOption {
         type = lib.types.package;
-        default = pkgs.nodePackages.pnpm.override {
+        default = pkgs.pnpm.override {
           nodejs = cfg.package;
         };
-        defaultText = lib.literalExpression "pkgs.nodePackages.pnpm";
+        defaultText = lib.literalExpression "pkgs.pnpm";
         description = "The pnpm package to use.";
       };
       install.enable = lib.mkEnableOption "pnpm install during devenv initialisation";
@@ -318,20 +311,33 @@ in
   };
 
   config = lib.mkIf cfg.enable {
-    packages
-      # Node ships with npm. If npm is enabled, use its package instead.
-      =
-      lib.optional (!cfg.npm.enable) cfg.package
-      ++ lib.optional cfg.npm.enable (cfg.npm.package)
+    changelogs = [
+      {
+        date = "2026-05-01";
+        title = "languages.javascript.nodejs.enable makes Node.js optional";
+        description = ''
+          Added `languages.javascript.nodejs.enable` (defaults to `true`) so Node.js can be opted out when only `bun` or another runtime is needed. Enabling `npm`, `pnpm`, `yarn`, `corepack`, or `lsp` requires `nodejs.enable = true`.
+        '';
+      }
+    ];
+
+    packages =
+      let
+        # On nixpkgs 26.05+, nodejs-slim has a corepack output.
+        corepack = cfg.package.corepack or cfg.package;
+      in
+      lib.optional cfg.nodejs.enable cfg.package
+      ++ lib.optional cfg.npm.enable cfg.npm.package
       ++ lib.optional cfg.pnpm.enable (cfg.pnpm.package)
       ++ lib.optional cfg.yarn.enable (cfg.yarn.package.override { nodejs = cfg.package; })
       ++ lib.optional cfg.bun.enable (cfg.bun.package)
-      ++ lib.optional cfg.corepack.enable (
-        pkgs.runCommand "corepack-enable" { } ''
+      ++ lib.optionals cfg.corepack.enable [
+        corepack
+        (pkgs.runCommand "corepack-enable" { } ''
           mkdir -p $out/bin
-          ${cfg.package}/bin/corepack enable --install-directory $out/bin
-        ''
-      )
+          ${corepack}/bin/corepack enable --install-directory $out/bin
+        '')
+      ]
       ++ lib.optional cfg.lsp.enable cfg.lsp.package;
 
     enterShell = lib.concatStringsSep "\n" (
@@ -353,5 +359,44 @@ in
         ''
       ]
     );
+
+    assertions = [
+      {
+        assertion = cfg.npm.enable -> cfg.nodejs.enable;
+        message = "languages.javascript.npm.enable requires languages.javascript.nodejs.enable = true;";
+      }
+      {
+        assertion = cfg.pnpm.enable -> cfg.nodejs.enable;
+        message = "languages.javascript.pnpm.enable requires languages.javascript.nodejs.enable = true;";
+      }
+      {
+        assertion = cfg.yarn.enable -> cfg.nodejs.enable;
+        message = "languages.javascript.yarn.enable requires languages.javascript.nodejs.enable = true;";
+      }
+      {
+        assertion = cfg.corepack.enable -> cfg.nodejs.enable;
+        message = "languages.javascript.corepack.enable requires languages.javascript.nodejs.enable = true;";
+      }
+      {
+        assertion = cfg.lsp.enable -> cfg.nodejs.enable;
+        message = "languages.javascript.lsp.enable requires languages.javascript.nodejs.enable = true;";
+      }
+      {
+        assertion = cfg.npm.install.enable -> cfg.npm.enable;
+        message = "languages.javascript.npm.install.enable requires languages.javascript.npm.enable = true;";
+      }
+      {
+        assertion = cfg.pnpm.install.enable -> cfg.pnpm.enable;
+        message = "languages.javascript.pnpm.install.enable requires languages.javascript.pnpm.enable = true;";
+      }
+      {
+        assertion = cfg.yarn.install.enable -> cfg.yarn.enable;
+        message = "languages.javascript.yarn.install.enable requires languages.javascript.yarn.enable = true;";
+      }
+      {
+        assertion = cfg.bun.install.enable -> cfg.bun.enable;
+        message = "languages.javascript.bun.install.enable requires languages.javascript.bun.enable = true;";
+      }
+    ];
   };
 }

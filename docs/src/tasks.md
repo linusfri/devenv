@@ -42,7 +42,13 @@ Succeeded         myapp:test          350ms
 
 ## enterShell / enterTest
 
-If you'd like the tasks to run as part of the `enterShell` or `enterTest`:
+`devenv:enterShell` and `devenv:enterTest` are built-in lifecycle events that run setup tasks at specific points:
+
+- **`devenv:enterShell`** runs before the shell is entered (`devenv shell`) and before processes start (`devenv up`).
+- **`devenv:enterTest`** runs before tests execute (`devenv test`).
+  It depends on `devenv:enterShell`, so all shell setup tasks run first automatically.
+
+To hook into these events, use `before` to declare that your task should run before the event completes:
 
 ```nix title="devenv.nix"
 { pkgs, lib, config, ... }:
@@ -51,7 +57,12 @@ If you'd like the tasks to run as part of the `enterShell` or `enterTest`:
   tasks = {
     "bash:hello" = {
       exec = "echo 'Hello world from bash!'";
-      before = [ "devenv:enterShell" "devenv:enterTest" ];
+      before = [ "devenv:enterShell" ];
+    };
+
+    "myapp:test-setup" = {
+      exec = "echo 'Preparing test fixtures...'";
+      before = [ "devenv:enterTest" ];
     };
   };
 }
@@ -61,11 +72,14 @@ If you'd like the tasks to run as part of the `enterShell` or `enterTest`:
 $ devenv shell
 ...
 Running tasks     devenv:enterShell
-Succeeded         devenv:pre-commit:install 25ms
+Succeeded         devenv:git-hooks:install  25ms
 Succeeded         bash:hello                 9ms
 Succeeded         devenv:enterShell         13ms
 3 Succeeded                                 28.14ms
 ```
+
+Many devenv modules automatically hook into these events.
+For example, enabling git hooks registers `devenv:git-hooks:install` as a dependency of `devenv:enterShell`.
 
 ## Using your favourite language
 
@@ -142,6 +156,7 @@ Tasks support passing inputs and produce outputs, both as JSON objects:
 - `$DEVENV_TASK_INPUT`: JSON object of `tasks."myapp:mytask".input`.
 - `$DEVENV_TASKS_OUTPUTS`: JSON object with dependent tasks as keys and their outputs as values.
 - `$DEVENV_TASK_OUTPUT_FILE`: a writable file with tasks' outputs in JSON.
+- `$DEVENV_TASK_EXPORTS_FILE`: a writable file where tasks can export environment variables. Write `name\0base64(value)\0` pairs to this file and they will be set in the environment of dependent tasks.
 
 ```nix title="devenv.nix"
 { pkgs, lib, config, ... }:
@@ -161,6 +176,29 @@ Tasks support passing inputs and produce outputs, both as JSON objects:
   };
 }
 ```
+
+### Shell messages
+
+!!! tip "New in version 2.1"
+
+Tasks can display messages to the user when entering the shell by writing a `devenv.messages` array to `$DEVENV_TASK_OUTPUT_FILE`. This is useful for showing informational output like trace URLs or setup status after initialization.
+
+```nix title="devenv.nix"
+{ pkgs, lib, config, ... }:
+
+{
+  tasks = {
+    "myapp:info" = {
+      exec = ''
+        echo '{"devenv":{"messages":["Setup complete. Dashboard: http://localhost:3000"]}}' > "$DEVENV_TASK_OUTPUT_FILE"
+      '';
+      before = [ "devenv:enterShell" ];
+    };
+  };
+}
+```
+
+Messages are printed after the shell environment is loaded, so they remain visible in the interactive session.
 
 ### Passing inputs from the CLI
 

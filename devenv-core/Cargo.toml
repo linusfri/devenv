@@ -9,20 +9,20 @@ snix = []
 
 [dependencies]
 devenv-activity.workspace = true
-devenv-cache-core.workspace = true
 nix-conf-parser.workspace = true
 pathdiff.workspace = true
 regex.workspace = true
 
 async-trait.workspace = true
-clap.workspace = true
+clap = { workspace = true, optional = true }
 miette.workspace = true
 num_enum.workspace = true
 thiserror.workspace = true
 
 netstat2.workspace = true
-once_cell.workspace = true
+socket2.workspace = true
 schemars.workspace = true
+semver.workspace = true
 schematic.workspace = true
 serde.workspace = true
 serde_json.workspace = true

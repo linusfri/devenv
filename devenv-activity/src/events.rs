@@ -35,7 +35,7 @@ pub struct SetExpected {
 }
 
 /// Categories for expected count tracking
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Valuable)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, Valuable)]
 #[serde(rename_all = "lowercase")]
 pub enum ExpectedCategory {
     /// Build activities (derivations to build)
@@ -142,6 +142,17 @@ pub enum FetchKind {
     Tree,
     /// Copying local sources to the store (e.g., flake inputs)
     Copy,
+}
+
+impl FetchKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            FetchKind::Download => "download",
+            FetchKind::Query => "query",
+            FetchKind::Tree => "tree",
+            FetchKind::Copy => "copy",
+        }
+    }
 }
 
 /// A filesystem or environment operation observed during Nix evaluation.
@@ -306,6 +317,9 @@ pub enum Process {
         /// Ports this process listens on (e.g., ["http:8080", "admin:9000"])
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         ports: Vec<String>,
+        /// Human-readable description of the readiness probe (e.g., "exec: pg_isready", "http: localhost:8080/health")
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ready_probe: Option<String>,
         #[serde(default)]
         level: ActivityLevel,
         timestamp: Timestamp,
@@ -336,10 +350,45 @@ pub enum Process {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Valuable)]
 #[serde(rename_all = "lowercase")]
 pub enum ProcessStatus {
+    /// Process has `start.enable = false`; not started yet but can be started later.
+    NotStarted,
+    /// Waiting for dependencies before starting.
+    Waiting,
+    /// Spawned; readiness probe has not yet passed.
+    Starting,
+    /// Running without a readiness probe configured.
     Running,
+    /// Readiness probe passed.
     Ready,
+    /// Stop + start cycle in progress.
     Restarting,
+    /// Graceful shutdown in progress (SIGTERM sent, waiting for exit and port release).
+    Stopping,
+    /// Exited.
     Stopped,
+}
+
+impl ProcessStatus {
+    /// Whether the process is in an active (non-terminal, non-idle) state.
+    pub fn is_active(&self) -> bool {
+        matches!(
+            self,
+            Self::Waiting
+                | Self::Starting
+                | Self::Running
+                | Self::Ready
+                | Self::Restarting
+                | Self::Stopping
+        )
+    }
+
+    /// Whether the process can be stopped by the user.
+    pub fn is_stoppable(&self) -> bool {
+        matches!(
+            self,
+            Self::Starting | Self::Running | Self::Ready | Self::Restarting
+        )
+    }
 }
 
 /// Operation activity events - generic devenv operations with log support
@@ -468,6 +517,38 @@ pub enum ActivityOutcome {
     Skipped,
     /// Task's dependency failed
     DependencyFailed,
+}
+
+impl ActivityOutcome {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ActivityOutcome::Success => "success",
+            ActivityOutcome::Failed => "failed",
+            ActivityOutcome::Cancelled => "cancelled",
+            ActivityOutcome::Cached => "cached",
+            ActivityOutcome::Skipped => "skipped",
+            ActivityOutcome::DependencyFailed => "dependency_failed",
+        }
+    }
+
+    /// Human-friendly suffix for completion lines (empty for plain success).
+    pub fn display_suffix(&self) -> &'static str {
+        match self {
+            ActivityOutcome::Success => "",
+            ActivityOutcome::Cached => " (cached)",
+            ActivityOutcome::Skipped => " (no command)",
+            ActivityOutcome::Cancelled => " (cancelled)",
+            ActivityOutcome::Failed => " (failed)",
+            ActivityOutcome::DependencyFailed => " (dependency failed)",
+        }
+    }
+
+    pub fn is_error(&self) -> bool {
+        matches!(
+            self,
+            ActivityOutcome::Failed | ActivityOutcome::DependencyFailed
+        )
+    }
 }
 
 /// Activity level (maps to tracing::Level)
@@ -746,5 +827,17 @@ mod tests {
             }
             _ => panic!("Expected Operation::Complete event"),
         }
+    }
+
+    #[test]
+    fn test_is_stoppable() {
+        assert!(!ProcessStatus::NotStarted.is_stoppable());
+        assert!(!ProcessStatus::Waiting.is_stoppable());
+        assert!(ProcessStatus::Starting.is_stoppable());
+        assert!(ProcessStatus::Running.is_stoppable());
+        assert!(ProcessStatus::Ready.is_stoppable());
+        assert!(ProcessStatus::Restarting.is_stoppable());
+        assert!(!ProcessStatus::Stopping.is_stoppable());
+        assert!(!ProcessStatus::Stopped.is_stoppable());
     }
 }

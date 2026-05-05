@@ -52,6 +52,50 @@ let
     follows = [ "nixpkgs" ];
   };
 
+  # Override nixpkgs' sitecustomize.py with a version that does not pop
+  # NIX_PYTHONPATH from the environment. The nixpkgs version uses
+  # os.environ.pop('NIX_PYTHONPATH'), which prevents the variable from
+  # being inherited by child processes spawned via subprocess.run() etc.
+  # This breaks Python tools in `packages` that invoke other Python tools
+  # as subprocesses (e.g. leanblueprint calling plastex).
+  #
+  # By setting PYTHONPATH to a directory containing only this patched
+  # sitecustomize.py, it is imported before the nixpkgs version (since
+  # PYTHONPATH entries precede site-packages on sys.path). The directory
+  # contains no actual packages, so venv priority is unaffected.
+  devenvSitecustomize = pkgs.writeTextDir "sitecustomize.py" ''
+    import site
+    import sys
+    import os
+    import functools
+
+    paths = os.environ.get('NIX_PYTHONPATH', None)
+    if paths:
+        functools.reduce(lambda k, p: site.addsitedir(p, k), paths.split(':'), site._init_pathinfo())
+
+    in_venv = sys.prefix != sys.base_prefix
+
+    if not in_venv:
+        executable = os.environ.pop('NIX_PYTHONEXECUTABLE', None)
+        prefix = os.environ.pop('NIX_PYTHONPREFIX', None)
+
+        if 'PYTHONEXECUTABLE' not in os.environ and executable is not None:
+            sys.executable = executable
+        if prefix is not None:
+            sys.prefix = sys.exec_prefix = prefix
+            site.PREFIXES.insert(0, prefix)
+  '';
+
+  # Write a .pth file into a venv's site-packages so that Nix profile
+  # packages are importable, but venv-installed packages take priority.
+  # Note: this is a secondary mechanism; NIX_PYTHONPATH in env also makes
+  # profile packages available via sitecustomize.py (which uses site.addsitedir
+  # to append after venv site-packages). The .pth file is kept for environments
+  # where sitecustomize.py may not run (e.g. python -S).
+  writePthFile = venvPath: ''
+    echo "$DEVENV_PROFILE/${cfg.package.sitePackages}" > "${venvPath}/${cfg.package.sitePackages}/devenv-profile.pth"
+  '';
+
   initVenvScript = ''
     pushd "${cfg.directory}"
 
@@ -93,6 +137,8 @@ let
       }
       echo "${cfg.package.interpreter}" > "$VENV_PATH/.devenv_interpreter"
     fi
+
+    ${writePthFile "$VENV_PATH"}
 
     source "$VENV_PATH"/bin/activate
 
@@ -144,7 +190,7 @@ let
         return 1
       fi
 
-      local UV_SYNC_COMMAND=(${cfg.uv.package}/bin/uv sync ${lib.escapeShellArgs cfg.uv.sync.arguments})
+      local UV_SYNC_COMMAND=(${cfg.uv.package}/bin/uv sync -p ${cfg.package.interpreter} ${lib.escapeShellArgs cfg.uv.sync.arguments})
 
       # Add extras if specified
       ${lib.concatMapStrings (extra: ''
@@ -178,7 +224,7 @@ let
 
       # Avoid running "uv sync" for every shell.
       # Only run it when the "pyproject.toml" file or Python interpreter has changed.
-      local ACTUAL_UV_CHECKSUM="${cfg.package.interpreter}:$(${pkgs.nix}/bin/nix-hash --type sha256 pyproject.toml):''${UV_SYNC_COMMAND[@]}"
+      local ACTUAL_UV_CHECKSUM="${cfg.package.interpreter}:${config.lib._fileChecksum "pyproject.toml"}:''${UV_SYNC_COMMAND[@]}"
       local UV_CHECKSUM_FILE="$VENV_PATH/uv.sync.checksum"
       if [ -f "$UV_CHECKSUM_FILE" ]
       then
@@ -206,10 +252,11 @@ let
 
     if [ ! -f "pyproject.toml" ]
     then
-      echo "No pyproject.toml found. Make sure you have a pyproject.toml file in your project." >&2
+      echo "No pyproject.toml found in ${cfg.directory}. Set languages.python.directory to the path containing your pyproject.toml." >&2
       exit 1
     else
       _devenv_uv_sync
+      ${writePthFile "$VENV_PATH"}
       ${lib.optionalString cfg.venv.enable ''
         source "$VENV_PATH"/bin/activate
       ''}
@@ -237,7 +284,7 @@ let
       # Avoid running "poetry install" for every shell.
       # Only run it when the "poetry.lock" file or Python interpreter has changed.
       # We do this by storing the interpreter path and a hash of "poetry.lock" in venv.
-      local ACTUAL_POETRY_CHECKSUM="${cfg.package.interpreter}:$(${pkgs.nix}/bin/nix-hash --type sha256 pyproject.toml):$(${pkgs.nix}/bin/nix-hash --type sha256 poetry.lock):''${POETRY_INSTALL_COMMAND[@]}"
+      local ACTUAL_POETRY_CHECKSUM="${cfg.package.interpreter}:${config.lib._fileChecksum "pyproject.toml"}:${config.lib._fileChecksum "poetry.lock"}:''${POETRY_INSTALL_COMMAND[@]}"
       local POETRY_CHECKSUM_FILE=".venv/poetry.lock.checksum"
       if [ -f "$POETRY_CHECKSUM_FILE" ]
       then
@@ -260,10 +307,12 @@ let
 
     if [ ! -f "pyproject.toml" ]
     then
-      echo "No pyproject.toml found. Run 'poetry init' to create one." >&2
+      echo "No pyproject.toml found in ${cfg.directory}. Set languages.python.directory to the path containing your pyproject.toml." >&2
+      echo "Run 'poetry init' to create one." >&2
       exit 1
     else
       _devenv_init_poetry_venv
+      ${writePthFile ".venv"}
       ${lib.optionalString cfg.poetry.install.enable ''
         _devenv_poetry_install
       ''}
@@ -297,7 +346,7 @@ in
           ]
           ++ lib.optionals pkgs.stdenv.isDarwin [
             "--prefix"
-            "DYLD_LIBRARY_PATH"
+            "DYLD_FALLBACK_LIBRARY_PATH"
             ":"
             (lib.makeLibraryPath libraries)
           ];
@@ -416,7 +465,7 @@ in
         - Executables use `--inherit-argv0` and `--resolve-argv0` to ensure Python initializes with correct `sys.prefix` and `sys.base_prefix`
         - Python package scripts are unwrapped to invoke the environment's interpreter directly
 
-        Without these fixes, venvs cannot access environment packages via `--system-site-packages`.
+        Without these fixes, Python may not initialize with the correct prefix paths.
 
         Enabled by default.
         Newer nixpkgs releases may include upstream fixes that make this patch obsolete.
@@ -692,14 +741,29 @@ in
     ++ lib.optional cfg.lsp.enable cfg.lsp.package;
 
     env =
-      (lib.optionalAttrs cfg.uv.enable {
-        # ummmmm how does this work? Can I even know the path to the devenv/state at this point?
+      {
+        # Prevent nixpkgs setup hooks from adding individual package store
+        # paths to PYTHONPATH. PYTHONPATH is prepended to sys.path before
+        # site-packages, breaking venv package priority. Nix-provided
+        # packages are made available via NIX_PYTHONPATH instead.
+        dontAddPythonPath = "1";
+        # Make profile packages (including transitive deps from packages added
+        # via `packages = [ pkgs.python3Packages.foo ]`) importable. Nix's
+        # sitecustomize.py processes this using site.addsitedir(), which appends
+        # paths after venv site-packages, preserving venv package priority.
+        NIX_PYTHONPATH = "${config.devenv.profile}/${cfg.package.sitePackages}";
+        # Override nixpkgs' sitecustomize.py so NIX_PYTHONPATH is not popped
+        # from the environment and survives into subprocesses.
+        PYTHONPATH = "${devenvSitecustomize}";
+      }
+      // (lib.optionalAttrs cfg.uv.enable {
         UV_PROJECT_ENVIRONMENT = "${config.env.DEVENV_STATE}/venv";
-        # Force uv not to download a Python binary when the version in pyproject.toml does not match the one installed by devenv
+        # Force uv to use the Nix-provided Python and never download its own
         UV_PYTHON_DOWNLOADS = "never";
-        # Make uv choose the first python on PATH that is not uv provided.
-        # The one it finds is then consistently the one from nix (which is what we want).
         UV_PYTHON_PREFERENCE = "only-system";
+        # Do not set UV_PYTHON here. It overrides VIRTUAL_ENV resolution
+        # and causes `uv pip install` to target the immutable Nix store
+        # prefix instead of the venv. See https://github.com/cachix/devenv/issues/2663
       })
       // (lib.optionalAttrs cfg.poetry.enable {
         # Make poetry use DEVENV_ROOT/.venv
@@ -745,9 +809,5 @@ in
         before = [ "devenv:enterShell" ];
       };
     };
-
-    enterShell = ''
-      export PYTHONPATH="$DEVENV_PROFILE/${cfg.package.sitePackages}''${PYTHONPATH:+:$PYTHONPATH}"
-    '';
   };
 }

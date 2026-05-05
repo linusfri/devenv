@@ -1,22 +1,8 @@
+#![cfg(feature = "test-all")]
 //! TUI snapshot tests.
 //!
 //! These tests verify that when activity events are fed into the model,
 //! the TUI renders the expected output.
-
-/// Assert a snapshot with timing filters to avoid flaky tests.
-/// Normalizes elapsed times like "123ms" -> "0ms" and "1.2s" -> "0.0s".
-macro_rules! assert_tui_snapshot {
-    ($output:expr) => {
-        insta::with_settings!({
-            filters => vec![
-                (r"\d+ms", "0ms"),
-                (r"\d+\.\d+s", "0.0s"),
-            ]
-        }, {
-            insta::assert_snapshot!($output);
-        });
-    };
-}
 
 use devenv_activity::{
     ActivityEvent, ActivityLevel, ActivityOutcome, Build, Evaluate, Fetch, FetchKind, Message,
@@ -29,7 +15,7 @@ const TEST_WIDTH: u16 = 80;
 const TEST_HEIGHT: u16 = 24;
 
 fn render_to_string(model: &ActivityModel, ui_state: &UiState) -> String {
-    let mut element = view(model, ui_state, RenderContext::Normal).into();
+    let mut element = view(model, ui_state, RenderContext::Normal, None, false).into();
     element.render(Some(TEST_WIDTH as usize)).to_string()
 }
 
@@ -87,7 +73,7 @@ fn task_start(id: u64) -> ActivityEvent {
 fn test_empty_model() {
     let (model, ui_state) = new_test_model();
     let output = render_to_string(&model, &ui_state);
-    assert_tui_snapshot!(output);
+    insta::assert_snapshot!(output);
 }
 
 /// Test that a single build activity shows in the TUI.
@@ -114,7 +100,7 @@ fn test_single_build_activity() {
     model.apply_activity_event(phase_event);
 
     let output = render_to_string(&model, &ui_state);
-    assert_tui_snapshot!(output);
+    insta::assert_snapshot!(output);
 }
 
 /// Test that a download activity with progress shows in the TUI.
@@ -143,7 +129,7 @@ fn test_download_with_progress() {
     model.apply_activity_event(progress_event);
 
     let output = render_to_string(&model, &ui_state);
-    assert_tui_snapshot!(output);
+    insta::assert_snapshot!(output);
 }
 
 /// Test that a task activity shows in the TUI.
@@ -162,7 +148,7 @@ fn test_task_running() {
     model.apply_activity_event(task_start(1));
 
     let output = render_to_string(&model, &ui_state);
-    assert_tui_snapshot!(output);
+    insta::assert_snapshot!(output);
 }
 
 /// Test that multiple concurrent activities show in the TUI.
@@ -214,7 +200,7 @@ fn test_multiple_activities() {
     model.apply_activity_event(task_start(3));
 
     let output = render_to_string(&model, &ui_state);
-    assert_tui_snapshot!(output);
+    insta::assert_snapshot!(output);
 }
 
 /// Test task status lifecycle: pending -> running -> success.
@@ -240,7 +226,7 @@ fn test_task_success() {
     model.apply_activity_event(complete_event);
 
     let output = render_to_string(&model, &ui_state);
-    assert_tui_snapshot!(output);
+    insta::assert_snapshot!(output);
 }
 
 /// Test task failure shows in the TUI.
@@ -260,7 +246,7 @@ fn test_task_failed() {
     model.apply_activity_event(complete_event);
 
     let output = render_to_string(&model, &ui_state);
-    assert_tui_snapshot!(output);
+    insta::assert_snapshot!(output);
 }
 
 /// Test that failed tasks show logs even when show_output=false.
@@ -305,7 +291,7 @@ fn test_task_failed_shows_logs() {
     model.apply_activity_event(complete_event);
 
     let output = render_to_string(&model, &ui_state);
-    assert_tui_snapshot!(output);
+    insta::assert_snapshot!(output);
 }
 
 /// Test that task with show_output=true displays logs in the TUI.
@@ -337,7 +323,7 @@ fn test_task_show_output_true() {
     }));
 
     let output = render_to_string(&model, &ui_state);
-    assert_tui_snapshot!(output);
+    insta::assert_snapshot!(output);
 }
 
 /// Test that task with show_output=false hides logs in the TUI.
@@ -369,7 +355,7 @@ fn test_task_show_output_false() {
     }));
 
     let output = render_to_string(&model, &ui_state);
-    assert_tui_snapshot!(output);
+    insta::assert_snapshot!(output);
 }
 
 /// Test evaluating activity shows in the TUI.
@@ -388,7 +374,7 @@ fn test_evaluating_activity() {
     model.apply_activity_event(event);
 
     let output = render_to_string(&model, &ui_state);
-    assert_tui_snapshot!(output);
+    insta::assert_snapshot!(output);
 }
 
 /// Test query activity shows in the TUI.
@@ -408,7 +394,7 @@ fn test_query_activity() {
     model.apply_activity_event(event);
 
     let output = render_to_string(&model, &ui_state);
-    assert_tui_snapshot!(output);
+    insta::assert_snapshot!(output);
 }
 
 /// Test fetch tree activity shows in the TUI.
@@ -428,7 +414,7 @@ fn test_fetch_tree_activity() {
     model.apply_activity_event(event);
 
     let output = render_to_string(&model, &ui_state);
-    assert_tui_snapshot!(output);
+    insta::assert_snapshot!(output);
 }
 
 /// Test download with substituter info shows in the TUI.
@@ -457,7 +443,7 @@ fn test_download_with_substituter() {
     model.apply_activity_event(progress_event);
 
     let output = render_to_string(&model, &ui_state);
-    assert_tui_snapshot!(output);
+    insta::assert_snapshot!(output);
 }
 
 /// Test that Nix evaluation with nested child activities (builds, fetches, downloads) shows hierarchy.
@@ -526,7 +512,7 @@ fn test_nested_evaluation_with_children() {
     model.apply_activity_event(nested_download_event);
 
     let output = render_to_string(&model, &ui_state);
-    assert_tui_snapshot!(output);
+    insta::assert_snapshot!(output);
 }
 
 /// Test that activity details are stored correctly.
@@ -546,7 +532,7 @@ fn test_activity_with_details() {
     model.apply_activity_event(parent_event);
 
     let output = render_to_string(&model, &ui_state);
-    assert_tui_snapshot!(output);
+    insta::assert_snapshot!(output);
 }
 
 /// Test multiple parallel builds running concurrently.
@@ -612,7 +598,7 @@ fn test_multiple_parallel_builds() {
     }));
 
     let output = render_to_string(&model, &ui_state);
-    assert_tui_snapshot!(output);
+    insta::assert_snapshot!(output);
 }
 
 /// Test parallel downloads and builds happening simultaneously.
@@ -699,7 +685,7 @@ fn test_parallel_downloads_and_builds() {
     }));
 
     let output = render_to_string(&model, &ui_state);
-    assert_tui_snapshot!(output);
+    insta::assert_snapshot!(output);
 }
 
 /// Test indeterminate progress shows in the TUI.
@@ -726,7 +712,7 @@ fn test_indeterminate_progress() {
     model.apply_activity_event(progress_event);
 
     let output = render_to_string(&model, &ui_state);
-    assert_tui_snapshot!(output);
+    insta::assert_snapshot!(output);
 }
 
 /// Test deep nesting (3+ levels) shows hierarchy correctly.
@@ -799,7 +785,7 @@ fn test_deep_nesting() {
     model.apply_activity_event(deep_fetch);
 
     let output = render_to_string(&model, &ui_state);
-    assert_tui_snapshot!(output);
+    insta::assert_snapshot!(output);
 }
 
 /// Test many concurrent activities (stress test for rendering).
@@ -863,7 +849,7 @@ fn test_many_concurrent_activities() {
     }
 
     let output = render_to_string(&model, &ui_state);
-    assert_tui_snapshot!(output);
+    insta::assert_snapshot!(output);
 }
 
 /// Test mixed completed and active activities.
@@ -930,7 +916,7 @@ fn test_mixed_completed_and_active() {
     }));
 
     let output = render_to_string(&model, &ui_state);
-    assert_tui_snapshot!(output);
+    insta::assert_snapshot!(output);
 }
 
 /// Test that standalone error messages (without parent) show in the TUI.
@@ -950,7 +936,7 @@ fn test_standalone_error_message() {
     model.apply_activity_event(error_event);
 
     let output = render_to_string(&model, &ui_state);
-    assert_tui_snapshot!(output);
+    insta::assert_snapshot!(output);
 }
 
 /// Test that multiple error messages show in the TUI.
@@ -980,7 +966,7 @@ fn test_multiple_error_messages() {
     model.apply_activity_event(error2);
 
     let output = render_to_string(&model, &ui_state);
-    assert_tui_snapshot!(output);
+    insta::assert_snapshot!(output);
 }
 
 /// Test that error messages with parent activities show as child activities.
@@ -1010,7 +996,7 @@ fn test_error_message_with_parent() {
     model.apply_activity_event(error_event);
 
     let output = render_to_string(&model, &ui_state);
-    assert_tui_snapshot!(output);
+    insta::assert_snapshot!(output);
 }
 
 /// Test that warning messages with parent activities show as child activities.
@@ -1040,7 +1026,7 @@ fn test_warning_message_with_parent() {
     model.apply_activity_event(warn_event);
 
     let output = render_to_string(&model, &ui_state);
-    assert_tui_snapshot!(output);
+    insta::assert_snapshot!(output);
 }
 
 /// Test error messages alongside active builds.
@@ -1075,7 +1061,7 @@ fn test_error_with_active_builds() {
     model.apply_activity_event(error_event);
 
     let output = render_to_string(&model, &ui_state);
-    assert_tui_snapshot!(output);
+    insta::assert_snapshot!(output);
 }
 
 /// Test that error messages with details show expansion indicator.
@@ -1105,7 +1091,7 @@ fn test_error_message_with_details() {
     model.apply_activity_event(error_event);
 
     let output = render_to_string(&model, &ui_state);
-    assert_tui_snapshot!(output);
+    insta::assert_snapshot!(output);
 }
 
 /// Test that error messages without details don't show the [+] indicator.
@@ -1135,7 +1121,74 @@ fn test_error_message_without_details() {
     model.apply_activity_event(error_event);
 
     let output = render_to_string(&model, &ui_state);
-    assert_tui_snapshot!(output);
+    insta::assert_snapshot!(output);
+}
+
+/// Test that failed evaluations show error details inline (not hidden behind navigation).
+/// The error details must be propagated from the child Message to the parent Evaluate
+/// activity's build_logs, because the child expires after the linger duration and gets
+/// pushed out by newer children (max_lines=5 default).
+/// Regression test for https://github.com/cachix/devenv/issues/2720
+#[test]
+fn test_evaluate_failed_shows_error_details() {
+    let (mut model, ui_state) = new_test_model();
+
+    // Start an evaluation
+    let eval_event = ActivityEvent::Evaluate(Evaluate::Start {
+        id: 1,
+        name: "Evaluating shell".to_string(),
+        level: ActivityLevel::Info,
+        parent: None,
+        timestamp: Timestamp::now(),
+    });
+    model.apply_activity_event(eval_event);
+
+    // Add an error message with details (as nix_log_bridge does for eval errors)
+    let error_event = ActivityEvent::Message(Message {
+        id: 100,
+        level: ActivityLevel::Error,
+        text: "Evaluation error: Failed to get drvPath from shell derivation".to_string(),
+        details: Some(
+            "… while evaluating the option `packages':\n\
+             … while evaluating definitions from `languages/rust.nix':\n\
+             \n\
+             error: To use 'languages.rust.channel', run the following command:\n\
+             \n\
+             $ devenv inputs add rust-overlay github:oxalica/rust-overlay --follows nixpkgs"
+                .to_string(),
+        ),
+        parent: Some(1),
+        timestamp: Timestamp::now(),
+    });
+    model.apply_activity_event(error_event);
+
+    // Complete the evaluation with failure
+    let complete_event = ActivityEvent::Evaluate(Evaluate::Complete {
+        id: 1,
+        outcome: ActivityOutcome::Failed,
+        timestamp: Timestamp::now(),
+    });
+    model.apply_activity_event(complete_event);
+
+    // Simulate the child error message expiring: backdate it past the linger duration,
+    // then add 5 lingering siblings to fill max_lines and push the expired error out.
+    if let Some(child) = model.activities.get_mut(&100) {
+        child.completed_at = Some(std::time::Instant::now() - std::time::Duration::from_secs(10));
+    }
+    for i in 0..5 {
+        let filler = ActivityEvent::Message(Message {
+            id: 200 + i,
+            level: ActivityLevel::Info,
+            text: format!("evaluating file {i}"),
+            details: None,
+            parent: Some(1),
+            timestamp: Timestamp::now(),
+        });
+        model.apply_activity_event(filler);
+    }
+
+    let output = render_to_string(&model, &ui_state);
+    insta::assert_snapshot!(output);
 }
 
 /// Test that failed devenv operations show logs automatically (not just when selected).
@@ -1183,7 +1236,7 @@ fn test_devenv_failed_shows_logs() {
     model.apply_activity_event(complete_event);
 
     let output = render_to_string(&model, &ui_state);
-    assert_tui_snapshot!(output);
+    insta::assert_snapshot!(output);
 }
 
 /// Test that a task with additional_parents appears under multiple parents.
@@ -1229,7 +1282,7 @@ fn test_task_additional_parents() {
 
     let output = render_to_string(&model, &ui_state);
     // The "build" task should appear under both test:unit and test:integration
-    assert_tui_snapshot!(output);
+    insta::assert_snapshot!(output);
 }
 
 #[test]
@@ -1278,19 +1331,19 @@ fn test_selectable_ids_dedup_for_multi_parent_tasks() {
         timestamp: Timestamp::now(),
     }));
 
-    let selectable = model.get_selectable_activity_ids();
+    let selectable = model.get_selectable_activity_ids(&ui_state);
     assert_eq!(selectable, vec![1, 3]);
 
-    ui_state.select_next_activity(&selectable);
+    ui_state.select_activity(&selectable, true);
     assert_eq!(ui_state.selected_activity, Some(1));
 
-    ui_state.select_next_activity(&selectable);
+    ui_state.select_activity(&selectable, true);
     assert_eq!(ui_state.selected_activity, Some(3));
 
-    ui_state.select_next_activity(&selectable);
+    ui_state.select_activity(&selectable, true);
     assert_eq!(ui_state.selected_activity, Some(3));
 
-    ui_state.select_previous_activity(&selectable);
+    ui_state.select_activity(&selectable, false);
     assert_eq!(ui_state.selected_activity, Some(1));
 }
 
@@ -1330,7 +1383,7 @@ fn test_task_queued_state() {
 
     let output = render_to_string(&model, &ui_state);
     // First task should show as running, others should show as pending/queued
-    assert_tui_snapshot!(output);
+    insta::assert_snapshot!(output);
 }
 
 /// Test that a task that completes without ever starting (skipped) shows correctly.
@@ -1357,7 +1410,7 @@ fn test_task_skipped_never_started() {
 
     let output = render_to_string(&model, &ui_state);
     // Task should show as skipped with zero duration
-    assert_tui_snapshot!(output);
+    insta::assert_snapshot!(output);
 }
 
 /// Test that a task cancelled due to dependency failure shows correctly.
@@ -1401,7 +1454,7 @@ fn test_task_dependency_failed_never_started() {
     }));
 
     let output = render_to_string(&model, &ui_state);
-    assert_tui_snapshot!(output);
+    insta::assert_snapshot!(output);
 }
 
 /// Test task hierarchy with 3+ levels of nesting.
@@ -1453,7 +1506,7 @@ fn test_task_deep_nesting() {
 
     let output = render_to_string(&model, &ui_state);
     // Should show proper indentation for each nesting level
-    assert_tui_snapshot!(output);
+    insta::assert_snapshot!(output);
 }
 
 /// Test multiple tasks under the same parent render in consistent order.
@@ -1505,7 +1558,7 @@ fn test_task_multiple_under_same_parent() {
 
     let output = render_to_string(&model, &ui_state);
     // Children should appear under parent in consistent order
-    assert_tui_snapshot!(output);
+    insta::assert_snapshot!(output);
 }
 
 /// Test diamond dependency pattern where a shared dependency appears under multiple parents.
@@ -1563,7 +1616,7 @@ fn test_task_diamond_dependency() {
 
     let output = render_to_string(&model, &ui_state);
     // Shared task should appear under both branch-a and branch-b
-    assert_tui_snapshot!(output);
+    insta::assert_snapshot!(output);
 }
 
 /// Test that when activities overflow a small terminal, the bottom content
@@ -1600,6 +1653,7 @@ fn test_overflow_clips_top_keeps_bottom() {
         parent: None,
         command: None,
         ports: vec![],
+        ready_probe: None,
         level: ActivityLevel::Info,
         timestamp: Timestamp::now(),
     }));
@@ -1637,6 +1691,208 @@ fn test_overflow_clips_top_keeps_bottom() {
     );
 }
 
+#[test]
+fn test_hide_stopped_processes_filters_manually_stopped_processes_but_keeps_failures() {
+    let (mut model, mut ui_state) = new_test_model();
+
+    model.apply_activity_event(ActivityEvent::Operation(Operation::Start {
+        id: 100,
+        name: "Running processes".to_string(),
+        parent: None,
+        detail: None,
+        level: ActivityLevel::Info,
+        timestamp: Timestamp::now(),
+    }));
+
+    for (id, name) in [(1, "clean-stop"), (2, "failed-stop"), (3, "running")] {
+        model.apply_activity_event(ActivityEvent::Process(Process::Start {
+            id,
+            name: name.to_string(),
+            parent: Some(100),
+            command: None,
+            ports: vec![],
+            ready_probe: None,
+            level: ActivityLevel::Info,
+            timestamp: Timestamp::now(),
+        }));
+    }
+
+    model.apply_activity_event(ActivityEvent::Process(Process::Status {
+        id: 1,
+        status: devenv_activity::ProcessStatus::Running,
+        timestamp: Timestamp::now(),
+    }));
+    model.apply_activity_event(ActivityEvent::Process(Process::Status {
+        id: 1,
+        status: devenv_activity::ProcessStatus::Stopped,
+        timestamp: Timestamp::now(),
+    }));
+    model.apply_activity_event(ActivityEvent::Process(Process::Complete {
+        id: 2,
+        outcome: ActivityOutcome::Failed,
+        timestamp: Timestamp::now(),
+    }));
+
+    let visible_before: Vec<_> = model
+        .get_display_activities(&ui_state)
+        .into_iter()
+        .map(|da| da.activity.name)
+        .collect();
+    assert!(visible_before.contains(&"clean-stop".to_string()));
+    assert!(visible_before.contains(&"failed-stop".to_string()));
+    assert!(visible_before.contains(&"running".to_string()));
+
+    ui_state.hide_stopped_processes = true;
+
+    let visible_after: Vec<_> = model
+        .get_display_activities(&ui_state)
+        .into_iter()
+        .map(|da| da.activity.name)
+        .collect();
+    assert!(!visible_after.contains(&"clean-stop".to_string()));
+    assert!(visible_after.contains(&"failed-stop".to_string()));
+    assert!(visible_after.contains(&"running".to_string()));
+
+    let summary = model.calculate_summary();
+    assert_eq!(
+        summary.stopped_processes, 1,
+        "summary.stopped_processes must match filter behaviour: only counts processes \
+         the filter would actually hide (i.e. clean stops, not failures)"
+    );
+}
+
+#[test]
+fn test_previous_hide_stopped_processes_coverage_used_completed_success() {
+    let (mut model, mut ui_state) = new_test_model();
+
+    model.apply_activity_event(ActivityEvent::Operation(Operation::Start {
+        id: 100,
+        name: "Running processes".to_string(),
+        parent: None,
+        detail: None,
+        level: ActivityLevel::Info,
+        timestamp: Timestamp::now(),
+    }));
+
+    model.apply_activity_event(ActivityEvent::Process(Process::Start {
+        id: 1,
+        name: "clean-stop".to_string(),
+        parent: Some(100),
+        command: None,
+        ports: vec![],
+        ready_probe: None,
+        level: ActivityLevel::Info,
+        timestamp: Timestamp::now(),
+    }));
+    model.apply_activity_event(ActivityEvent::Process(Process::Complete {
+        id: 1,
+        outcome: ActivityOutcome::Success,
+        timestamp: Timestamp::now(),
+    }));
+
+    ui_state.hide_stopped_processes = true;
+
+    let visible_after: Vec<_> = model
+        .get_display_activities(&ui_state)
+        .into_iter()
+        .map(|da| da.activity.name)
+        .collect();
+    assert!(
+        !visible_after.contains(&"clean-stop".to_string()),
+        "The old test shape used Process::Complete(Success), which already matched the previous filter."
+    );
+}
+
+#[test]
+fn test_toggle_hide_stopped_processes_clears_hidden_selection() {
+    let (mut model, mut ui_state) = new_test_model();
+
+    model.apply_activity_event(ActivityEvent::Operation(Operation::Start {
+        id: 100,
+        name: "Running processes".to_string(),
+        parent: None,
+        detail: None,
+        level: ActivityLevel::Info,
+        timestamp: Timestamp::now(),
+    }));
+
+    model.apply_activity_event(ActivityEvent::Process(Process::Start {
+        id: 1,
+        name: "clean-stop".to_string(),
+        parent: Some(100),
+        command: None,
+        ports: vec![],
+        ready_probe: None,
+        level: ActivityLevel::Info,
+        timestamp: Timestamp::now(),
+    }));
+    model.apply_activity_event(ActivityEvent::Process(Process::Status {
+        id: 1,
+        status: devenv_activity::ProcessStatus::Stopped,
+        timestamp: Timestamp::now(),
+    }));
+
+    ui_state.selected_activity = Some(1);
+    ui_state.toggle_hide_stopped_processes();
+    if let Some(id) = ui_state.selected_activity
+        && !model.is_selectable(id, &ui_state)
+    {
+        ui_state.selected_activity = None;
+    }
+
+    assert!(ui_state.hide_stopped_processes);
+    assert_eq!(ui_state.selected_activity, None);
+}
+
+#[test]
+fn test_hide_stopped_processes_removes_hidden_processes_from_selection() {
+    let (mut model, mut ui_state) = new_test_model();
+
+    model.apply_activity_event(ActivityEvent::Operation(Operation::Start {
+        id: 100,
+        name: "Running processes".to_string(),
+        parent: None,
+        detail: None,
+        level: ActivityLevel::Info,
+        timestamp: Timestamp::now(),
+    }));
+
+    model.apply_activity_event(ActivityEvent::Process(Process::Start {
+        id: 1,
+        name: "clean-stop".to_string(),
+        parent: Some(100),
+        command: None,
+        ports: vec![],
+        ready_probe: None,
+        level: ActivityLevel::Info,
+        timestamp: Timestamp::now(),
+    }));
+    model.apply_activity_event(ActivityEvent::Process(Process::Status {
+        id: 1,
+        status: devenv_activity::ProcessStatus::Stopped,
+        timestamp: Timestamp::now(),
+    }));
+
+    model.apply_activity_event(ActivityEvent::Process(Process::Start {
+        id: 2,
+        name: "running".to_string(),
+        parent: Some(100),
+        command: None,
+        ports: vec![],
+        ready_probe: None,
+        level: ActivityLevel::Info,
+        timestamp: Timestamp::now(),
+    }));
+
+    let selectable_before = model.get_selectable_activity_ids(&ui_state);
+    assert_eq!(selectable_before, vec![1, 2]);
+
+    ui_state.hide_stopped_processes = true;
+
+    let selectable_after = model.get_selectable_activity_ids(&ui_state);
+    assert_eq!(selectable_after, vec![2]);
+}
+
 /// Test cachix push operation starting shows in the TUI.
 #[test]
 fn test_cachix_push_started() {
@@ -1652,7 +1908,7 @@ fn test_cachix_push_started() {
     }));
 
     let output = render_to_string(&model, &ui_state);
-    assert_tui_snapshot!(output);
+    insta::assert_snapshot!(output);
 }
 
 /// Test cachix push operation with progress updates showing path detail.
@@ -1678,7 +1934,7 @@ fn test_cachix_push_progress() {
     }));
 
     let output = render_to_string(&model, &ui_state);
-    assert_tui_snapshot!(output);
+    insta::assert_snapshot!(output);
 }
 
 /// Test cachix push operation completing successfully.
@@ -1710,7 +1966,7 @@ fn test_cachix_push_success() {
     }));
 
     let output = render_to_string(&model, &ui_state);
-    assert_tui_snapshot!(output);
+    insta::assert_snapshot!(output);
 }
 
 /// Test cachix push operation with failed paths shows error logs.
@@ -1764,7 +2020,87 @@ fn test_cachix_push_with_failures() {
     }));
 
     let output = render_to_string(&model, &ui_state);
-    assert_tui_snapshot!(output);
+    insta::assert_snapshot!(output);
+}
+
+/// Test that non-process activities (like "Evaluating Nix") appear first,
+/// followed by processes in alphabetical order.
+#[test]
+fn test_processes_alphabetical_order() {
+    let (mut model, ui_state) = new_test_model();
+
+    // Create the "Running processes" parent operation (matches real usage)
+    model.apply_activity_event(ActivityEvent::Operation(Operation::Start {
+        id: 100,
+        name: "Running processes".to_string(),
+        parent: None,
+        detail: None,
+        level: ActivityLevel::Info,
+        timestamp: Timestamp::now(),
+    }));
+
+    // Start processes in non-alphabetical order (z, a, m)
+    model.apply_activity_event(ActivityEvent::Process(Process::Start {
+        id: 1,
+        name: "zookeeper".to_string(),
+        parent: Some(100),
+        command: None,
+        ports: vec![],
+        ready_probe: None,
+        level: ActivityLevel::Info,
+        timestamp: Timestamp::now(),
+    }));
+    model.apply_activity_event(ActivityEvent::Process(Process::Start {
+        id: 2,
+        name: "api-server".to_string(),
+        parent: Some(100),
+        command: None,
+        ports: vec![],
+        ready_probe: None,
+        level: ActivityLevel::Info,
+        timestamp: Timestamp::now(),
+    }));
+
+    // Add "Evaluating Nix" as a child of "Running processes" (happens during process manager eval)
+    model.apply_activity_event(ActivityEvent::Evaluate(Evaluate::Start {
+        id: 3,
+        name: "Evaluating Nix".to_string(),
+        parent: Some(100),
+        level: ActivityLevel::Info,
+        timestamp: Timestamp::now(),
+    }));
+
+    model.apply_activity_event(ActivityEvent::Process(Process::Start {
+        id: 4,
+        name: "mysql".to_string(),
+        parent: Some(100),
+        command: None,
+        ports: vec![],
+        ready_probe: None,
+        level: ActivityLevel::Info,
+        timestamp: Timestamp::now(),
+    }));
+
+    let output = render_to_string(&model, &ui_state);
+
+    // Verify "Evaluating Nix" comes first, then processes alphabetically
+    let eval_pos = output
+        .find("Evaluating Nix")
+        .expect("Evaluating Nix should be in output");
+    let api_pos = output
+        .find("api-server")
+        .expect("api-server should be in output");
+    let mysql_pos = output.find("mysql").expect("mysql should be in output");
+    let zoo_pos = output
+        .find("zookeeper")
+        .expect("zookeeper should be in output");
+    assert!(
+        eval_pos < api_pos && api_pos < mysql_pos && mysql_pos < zoo_pos,
+        "Evaluating Nix should come first, then processes in alphabetical order.\nFull output:\n{}",
+        output
+    );
+
+    insta::assert_snapshot!(output);
 }
 
 /// Test cachix push alongside other activities (build + push concurrent).
@@ -1803,5 +2139,5 @@ fn test_cachix_push_alongside_build() {
     }));
 
     let output = render_to_string(&model, &ui_state);
-    assert_tui_snapshot!(output);
+    insta::assert_snapshot!(output);
 }

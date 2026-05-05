@@ -19,6 +19,17 @@ pub struct SpinnerProps {
     pub color: Option<Color>,
 }
 
+#[cfg(feature = "deterministic-tui")]
+#[component]
+pub fn Spinner(_hooks: Hooks, props: &SpinnerProps) -> impl Into<AnyElement<'static>> {
+    let color = props.color.unwrap_or(COLOR_ACTIVE);
+
+    element! {
+        Text(content: SPINNER_FRAMES[0], color: color)
+    }
+}
+
+#[cfg(not(feature = "deterministic-tui"))]
 #[component]
 pub fn Spinner(mut hooks: Hooks, props: &SpinnerProps) -> impl Into<AnyElement<'static>> {
     let mut frame = hooks.use_state(|| 0usize);
@@ -27,7 +38,10 @@ pub fn Spinner(mut hooks: Hooks, props: &SpinnerProps) -> impl Into<AnyElement<'
     hooks.use_future(async move {
         loop {
             tokio::time::sleep(Duration::from_millis(SPINNER_INTERVAL_MS)).await;
-            frame.set((frame.get() + 1) % SPINNER_FRAMES.len());
+            let Some(val) = frame.try_get() else {
+                break;
+            };
+            frame.set((val + 1) % SPINNER_FRAMES.len());
         }
     });
 
@@ -75,6 +89,9 @@ pub const LOG_VIEWPORT_SHOW_OUTPUT: usize = 3;
 /// When `high_resolution` is true, shows ms for sub-second durations.
 /// When `high_resolution` is false, hides if < 300ms, otherwise shows x.xs resolution.
 pub fn format_elapsed_time(elapsed: Duration, high_resolution: bool) -> String {
+    if cfg!(feature = "deterministic-tui") {
+        return "[TIME]".to_string();
+    }
     let total_secs = elapsed.as_secs();
     if total_secs < 1 {
         if high_resolution {
@@ -181,7 +198,7 @@ impl ActivityTextComponent {
         depth: usize,
         prefix_children: Vec<AnyElement<'static>>,
     ) -> AnyElement<'static> {
-        let (shortened_name, show_suffix) = calculate_display_info(
+        let (shortened_name, display_suffix) = calculate_display_info(
             &self.name,
             terminal_width as u32,
             &self.action,
@@ -203,9 +220,7 @@ impl ActivityTextComponent {
             (Color::Reset, COLOR_SECONDARY, COLOR_HIERARCHY, None)
         } else if self.is_completed {
             (COLOR_ACTIVE_NESTED, COLOR_SECONDARY, COLOR_HIERARCHY, None)
-        } else if depth == 0 {
-            (COLOR_ACTIVE, COLOR_SECONDARY, COLOR_HIERARCHY, None)
-        } else if matches!(self.variant, ActivityVariant::Process(_)) {
+        } else if depth == 0 || matches!(self.variant, ActivityVariant::Process(_)) {
             (COLOR_ACTIVE, COLOR_SECONDARY, COLOR_HIERARCHY, None)
         } else {
             (COLOR_ACTIVE_NESTED, COLOR_SECONDARY, COLOR_HIERARCHY, None)
@@ -258,10 +273,10 @@ impl ActivityTextComponent {
                         } else {
                             vec![]
                         })
-                        #(if show_suffix && self.suffix.is_some() {
+                        #(if let Some(ref suffix_text) = display_suffix {
                             // Suffix always has a predecessor (action or name)
                             vec![element!(View(margin_left: 1) {
-                                Text(content: self.suffix.as_ref().expect("suffix should be Some when show_suffix is true"), color: suffix_color)
+                                Text(content: suffix_text, color: suffix_color)
                             }).into_any()]
                         } else {
                             vec![]
@@ -293,10 +308,10 @@ impl ActivityTextComponent {
                         } else {
                             vec![]
                         })
-                        #(if show_suffix && self.suffix.is_some() {
+                        #(if let Some(ref suffix_text) = display_suffix {
                             // Suffix always has a predecessor (action or name)
                             vec![element!(View(margin_left: 1) {
-                                Text(content: self.suffix.as_ref().expect("suffix should be Some when show_suffix is true"), color: suffix_color)
+                                Text(content: suffix_text, color: suffix_color)
                             }).into_any()]
                         } else {
                             vec![]
@@ -568,7 +583,11 @@ impl<'a> DownloadActivityComponent<'a> {
     }
 }
 
-/// Calculate display info for activity considering terminal width
+/// Calculate display info for activity considering terminal width.
+///
+/// Returns `(shortened_name, optional_shortened_suffix)`. When space is tight,
+/// the suffix is truncated from the right first, then dropped, then the name
+/// is truncated from the left.
 pub fn calculate_display_info(
     path: &str,
     terminal_width: u32,
@@ -576,8 +595,8 @@ pub fn calculate_display_info(
     suffix: Option<&str>,
     elapsed: &str,
     depth: usize,
-) -> (String, bool) {
-    // Calculate base width without suffix: padding + indent + hierarchy + action + margin + name + margin + elapsed
+) -> (String, Option<String>) {
+    // Calculate base width: padding + indent + hierarchy + spinner + action + name_margin + elapsed
     let indent_width = if depth > 0 {
         2 + (depth - 1) * 2 // spinner offset (2) + nesting indent
     } else {
@@ -601,38 +620,47 @@ pub fn calculate_display_info(
 
     if base_width >= available_width {
         // Very constrained, hide suffix and use shortest possible path
-        return (shorten_store_path_aggressive(path), false);
+        return (shorten_store_path_aggressive(path), None);
     }
 
-    let remaining_width_without_suffix = available_width - base_width;
+    let remaining = available_width - base_width;
+    let suffix_total = suffix.map(|s| s.chars().count() + 1).unwrap_or(0); // +1 for leading margin
 
-    // Always show suffix if present - let flexbox overflow handle truncation
-    let show_suffix = suffix.is_some();
-    let suffix_width = suffix.map(|s| s.len() + 1).unwrap_or(0); // suffix + space prefix
-
-    let remaining_width_for_path = if show_suffix {
-        remaining_width_without_suffix.saturating_sub(suffix_width)
-    } else {
-        remaining_width_without_suffix
-    };
-
-    // If path fits in remaining width, don't shorten
-    if path.len() <= remaining_width_for_path {
-        return (path.to_string(), show_suffix);
+    // Everything fits
+    if path.len() + suffix_total <= remaining {
+        return (path.to_string(), suffix.map(|s| s.to_string()));
     }
 
-    // Path doesn't fit - truncate from the left to keep meaningful filename
-    if remaining_width_for_path > 4 {
-        // Use char indices to avoid slicing in the middle of UTF-8 characters
+    // Doesn't fit. Truncate suffix first, then drop it, then truncate name.
+    if let Some(suffix_str) = suffix {
+        let suffix_chars: Vec<char> = suffix_str.chars().collect();
+        // How much space is left for suffix after the name?
+        let space_for_suffix = remaining.saturating_sub(path.len() + 1); // +1 for margin
+        if space_for_suffix >= suffix_chars.len() {
+            // Suffix fits, name is the problem
+            return (path.to_string(), Some(suffix_str.to_string()));
+        }
+        if space_for_suffix >= 2 {
+            // Truncate suffix from the right
+            let kept: String = suffix_chars[..space_for_suffix - 1].iter().collect();
+            return (path.to_string(), Some(format!("{}…", kept)));
+        }
+        // No room for suffix at all, drop it
+        if path.len() <= remaining {
+            return (path.to_string(), None);
+        }
+    }
+
+    // No suffix (or dropped). Truncate name from the left.
+    if remaining > 4 {
         let chars: Vec<char> = path.chars().collect();
-        let start_char = chars.len().saturating_sub(remaining_width_for_path - 1);
+        let start_char = chars.len().saturating_sub(remaining - 1);
         let truncated_chars: String = chars.iter().skip(start_char).collect();
-        let truncated = format!("…{}", truncated_chars);
-        return (truncated, show_suffix);
+        return (format!("…{}", truncated_chars), None);
     }
 
-    // If extremely narrow, just show ellipsis
-    ("…".to_string(), false)
+    // Extremely narrow
+    ("…".to_string(), None)
 }
 
 /// Aggressively shorten a store path for very narrow terminals
@@ -726,20 +754,31 @@ impl<'a> ExpandedContentComponent<'a> {
                 for line in visible_lines {
                     line_elements.push(
                         element! {
-                            View(height: 1, flex_direction: FlexDirection::Row, padding_left: indent as u32, padding_right: 1) {
-                                Text(content: format!("│ {line}"), color: Color::AnsiValue(245))
+                            View(height: 1, flex_direction: FlexDirection::Row) {
+                                Text(content: format!(" {line}"), color: Color::AnsiValue(245))
                             }
                         }
                         .into_any(),
                     );
                 }
 
-                return vec![element! {
-                    View(height: actual_height as u32, flex_direction: FlexDirection::Column, overflow: Overflow::Hidden) {
-                        #(line_elements)
+                return vec![
+                    element! {
+                        View(
+                            height: actual_height as u32,
+                            flex_direction: FlexDirection::Column,
+                            overflow: Overflow::Hidden,
+                            margin_left: indent as u32,
+                            margin_right: 1,
+                            border_style: BorderStyle::Single,
+                            border_edges: Edges::Left,
+                            border_color: Color::AnsiValue(245),
+                        ) {
+                            #(line_elements)
+                        }
                     }
-                }
-                .into_any()];
+                    .into_any(),
+                ];
             }
         }
 
@@ -784,3 +823,191 @@ impl<'a> ExpandedContentComponent<'a> {
 
 /// Backwards-compatible alias
 pub type BuildLogsComponent<'a> = ExpandedContentComponent<'a>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // For depth=0, action="", elapsed="1.0s":
+    // base_width = padding(2) + spinner(2) + action(0+1) + name_margin(1) + elapsed(4) = 10
+    // remaining = terminal_width - 10
+
+    #[test]
+    fn everything_fits_with_suffix() {
+        // remaining = 100 - 10 = 90, name(24) + suffix(7+1margin) = 32 fits
+        let (name, suffix) = calculate_display_info(
+            "devenv:python:virtualenv",
+            100,
+            "",
+            Some("4 lines"),
+            "1.0s",
+            0,
+        );
+        assert_eq!(name, "devenv:python:virtualenv");
+        assert_eq!(suffix.as_deref(), Some("4 lines"));
+    }
+
+    #[test]
+    fn everything_fits_without_suffix() {
+        let (name, suffix) =
+            calculate_display_info("devenv:python:virtualenv", 80, "", None, "1.0s", 0);
+        assert_eq!(name, "devenv:python:virtualenv");
+        assert_eq!(suffix, None);
+    }
+
+    #[test]
+    fn long_suffix_truncated_before_name() {
+        // remaining = 60 - 10 = 50, name=24
+        // space_for_suffix = 50 - 24 - 1(margin) = 25 chars
+        // suffix(63 chars) > 25 so truncated to 25 chars (24 kept + …)
+        let long_suffix = "4 lines → DEVENV_EXPORT:VklSVFVBTF9FTlY==L2hvbWUvZG9tZW4vZGV2";
+        let (name, suffix) = calculate_display_info(
+            "devenv:python:virtualenv",
+            60,
+            "",
+            Some(long_suffix),
+            "1.0s",
+            0,
+        );
+        assert_eq!(name, "devenv:python:virtualenv");
+        let suffix = suffix.expect("suffix should be shown");
+        assert!(
+            suffix.starts_with("4 lines"),
+            "truncation preserves the start"
+        );
+        assert!(suffix.ends_with('…'));
+        assert_eq!(suffix.chars().count(), 25);
+    }
+
+    #[test]
+    fn suffix_dropped_when_only_1_char_available() {
+        // remaining = 36 - 10 = 26, name=24
+        // space_for_suffix = 26 - 24 - 1(margin) = 1 char, which is < 2 so suffix is dropped
+        let (name, suffix) = calculate_display_info(
+            "devenv:python:virtualenv",
+            36,
+            "",
+            Some("cached"),
+            "1.0s",
+            0,
+        );
+        assert_eq!(name, "devenv:python:virtualenv");
+        assert_eq!(suffix, None);
+    }
+
+    #[test]
+    fn name_truncated_left_when_no_suffix() {
+        // remaining = 20 - 10 = 10, name=24 doesn't fit, 10 > 4 so left-truncate
+        // start_char = 24 - (10-1) = 15, keeps 9 chars + "…" = 10 chars
+        let (name, suffix) =
+            calculate_display_info("devenv:python:virtualenv", 20, "", None, "1.0s", 0);
+        assert!(name.starts_with('…'));
+        assert_eq!(name.chars().count(), 10);
+        assert_eq!(suffix, None);
+    }
+
+    #[test]
+    fn name_truncated_after_suffix_dropped() {
+        // remaining = 20 - 10 = 10, name=24 doesn't fit
+        // suffix can't fit either, gets dropped, then name is left-truncated to 10 chars
+        let (name, suffix) = calculate_display_info(
+            "devenv:python:virtualenv",
+            20,
+            "",
+            Some("4 lines"),
+            "1.0s",
+            0,
+        );
+        assert!(name.starts_with('…'));
+        assert_eq!(name.chars().count(), 10);
+        assert_eq!(suffix, None);
+    }
+
+    #[test]
+    fn very_constrained_uses_aggressive_shortening() {
+        // base=10 >= terminal=5, hits shorten_store_path_aggressive
+        let (name, suffix) = calculate_display_info(
+            "/nix/store/abc123hash-some-package-1.0",
+            5,
+            "",
+            Some("4 lines"),
+            "1.0s",
+            0,
+        );
+        assert_eq!(suffix, None);
+        // shorten_store_path_aggressive keeps package name after hash
+        assert!(name.contains("some-package"), "got: {}", name);
+    }
+
+    #[test]
+    fn extremely_narrow_remaining() {
+        // remaining = 14 - 10 = 4, which is <= 4 so just "…"
+        let (name, suffix) =
+            calculate_display_info("devenv:python:virtualenv", 14, "", None, "1.0s", 0);
+        assert_eq!(name, "…");
+        assert_eq!(suffix, None);
+    }
+
+    #[test]
+    fn nesting_reduces_budget() {
+        // depth=0: base = 10, remaining = 42-10 = 32
+        // depth=2: base = padding(2)+indent(4)+hierarchy(2)+spinner(0)+action(0+1)+name_margin(1)+elapsed(4) = 14
+        //          remaining = 42 - 14 = 28
+        // name(24) + suffix("cached" 6+1margin) = 31
+        // depth=0: 32 >= 31, fits
+        // depth=2: 28 < 31, doesn't fit, space_for_suffix = 28-24-1 = 3 >= 2, so suffix truncated
+        let (_, suffix_shallow) = calculate_display_info(
+            "devenv:python:virtualenv",
+            42,
+            "",
+            Some("cached"),
+            "1.0s",
+            0,
+        );
+        let (name_deep, suffix_deep) = calculate_display_info(
+            "devenv:python:virtualenv",
+            42,
+            "",
+            Some("cached"),
+            "1.0s",
+            2,
+        );
+        assert_eq!(suffix_shallow.as_deref(), Some("cached"));
+        assert_eq!(name_deep, "devenv:python:virtualenv");
+        let s = suffix_deep.expect("suffix should be truncated not dropped");
+        assert!(s.ends_with('…'));
+        assert_eq!(s.chars().count(), 3);
+    }
+
+    #[test]
+    fn action_reduces_budget() {
+        // action="building"(8+1=9)
+        // base = padding(2)+spinner(2)+action(9)+name_margin(1)+elapsed(4) = 18
+        // remaining = 60 - 18 = 42, name("some-package")=12
+        // space_for_suffix = 42 - 12 - 1 = 29
+        // suffix(56 chars) > 29 so truncated to 29 chars (28 kept + …)
+        let long_suffix = "4 lines → DEVENV_EXPORT:VklSVFVBTF9FTlY==L2hvbWUvZG9tZW4";
+        let (name, suffix) =
+            calculate_display_info("some-package", 60, "building", Some(long_suffix), "1.0s", 0);
+        assert_eq!(name, "some-package");
+        let suffix = suffix.expect("suffix should be truncated");
+        assert!(suffix.ends_with('…'));
+        assert_eq!(suffix.chars().count(), 29);
+    }
+
+    #[test]
+    fn multibyte_suffix_does_not_panic() {
+        // Suffix with multi-byte UTF-8 chars: .len() (bytes) > .chars().count()
+        // This previously panicked because byte length was used for comparison
+        // but char index was used for slicing.
+        // "ä" is 2 bytes in UTF-8, so 30 chars = 60 bytes.
+        // With terminal_width=80, action="building", path="pkg":
+        //   base_width = 2+2+9+1+4 = 18, remaining = 62
+        //   space_for_suffix = 62 - 3 - 1 = 58
+        //   Old code: 58 >= suffix.len()(60) → false, then chars[..57] on 30-char vec → panic!
+        let suffix = "ääääääääääääääääääääääääääääää"; // 30 chars, 60 bytes
+        let (name, _suffix) =
+            calculate_display_info("pkg", 80, "building", Some(suffix), "1.0s", 0);
+        assert_eq!(name, "pkg");
+    }
+}

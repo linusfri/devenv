@@ -25,9 +25,23 @@ To start the processes, run:
 $ devenv up
 ```
 
+To stop detached processes:
+
+```shell-session
+$ devenv processes down
+```
+
+To wait for all processes to become ready (useful in CI):
+
+```shell-session
+$ devenv processes wait --timeout 120
+```
+
+The default timeout is 120 seconds.
+
 ## Dependencies
 
-Processes can depend on other processes using `after` and `before`:
+Processes can depend on other processes and tasks using `after` and `before`:
 
 ```nix title="devenv.nix"
 {
@@ -42,7 +56,19 @@ Processes can depend on other processes using `after` and `before`:
 }
 ```
 
-Use `@complete` to wait for a process to stop (soft dependency), or `@ready` (default) for readiness.
+Dependency suffixes control when a dependency is considered satisfied.
+
+For **process** dependencies:
+
+- `@started` — wait for the process to begin execution
+- `@ready` (default) — wait for the readiness probe to pass
+- `@completed` — wait for the process to finish, regardless of exit code (soft dependency, does not propagate failure)
+
+For **task** dependencies:
+
+- `@started` — wait for the task to begin execution
+- `@succeeded` (default) — wait for the task to exit with code 0
+- `@completed` — wait for the task to finish, regardless of exit code (soft dependency, does not propagate failure)
 
 ## Using Pre-built Services
 
@@ -290,11 +316,20 @@ This is particularly useful for:
 
 ### Strict port mode
 
-If you want devenv to fail when a port is already in use instead of automatically finding the next available port, use the `--strict-ports` flag:
+If you want devenv to fail when a port is already in use instead of automatically finding the next available port, you can set the default in `devenv.yaml`:
+
+```yaml
+strictPorts: true
+```
+
+Or override it for a single run with CLI flags:
 
 ```shell-session
 $ devenv up --strict-ports
+$ devenv up --no-strict-ports
 ```
+
+The CLI flags take precedence over the config value.
 
 This is useful when you need deterministic port assignments and want to be notified of conflicts rather than having them silently resolved. When a port conflict is detected in strict mode, devenv will show an error message including which process is currently using the port.
 

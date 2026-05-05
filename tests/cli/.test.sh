@@ -2,14 +2,15 @@ set -xe
 
 rm devenv.yaml || true
 devenv shell -- env | grep "DEVENV_CMDLINE"
+devenv shell -- env | grep "DEVENV_CLI_TEST_VAR=hello-from-task"
 devenv build languages.python.package
 devenv shell ls -- -la | grep ".test.sh"
 devenv shell ls ../ | grep "cli"
 devenv info | grep "python3-"
 devenv show | grep "python3-"
 devenv search ncdu 2>&1 | grep -E "Found [0-9]+ packages and [0-9]+ options for 'ncdu'"
-devenv --trace-output file:search-trace.log search '^ncdu$' 2>&1 | grep -E "Found [0-9]+ packages and [0-9]+ options"
-grep "Cache hit" search-trace.log
+devenv --verbose --trace-output file:search-trace.log search '^ncdu$' 2>&1 | grep -E "Found [0-9]+ packages and [0-9]+ options"
+grep "Cache hit" search-trace.log | grep "optionsJSON"
 devenv search xyznonexistentpackagexyz 2>&1 | grep -E "Found 0 packages and 0 options"
 
 # there should be no processes
@@ -62,6 +63,11 @@ echo "$output" | grep -q "languages.rust" || exit 1
 cd ..
 rm -rf test-from-only
 echo "✓ --from works without local devenv.nix"
+
+# Test -O packages:pkgs appends packages
+echo "Testing -O packages:pkgs..."
+devenv -O packages:pkgs "hello" shell -- hello | grep -q "Hello, world"
+echo "✓ -O packages:pkgs works"
 
 # Test -f short form
 echo "Testing -f short form..."

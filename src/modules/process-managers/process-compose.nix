@@ -2,6 +2,40 @@
 let
   cfg = config.process.managers.process-compose;
   settingsFormat = pkgs.formats.yaml { };
+
+  parseProcessDep = import ../lib/parse-process-dep.nix { inherit lib; };
+
+  # Compute depends_on entries from `before` lists across all processes.
+  # If process A says before = ["devenv:processes:B"], then B depends_on A.
+  beforeDepsMap =
+    let
+      allProcesses = config.processes;
+      contributions = lib.concatLists (lib.mapAttrsToList
+        (name: process:
+          let
+            beforeProcessDeps = lib.filter (x: x != null) (map parseProcessDep process.before);
+          in
+          map
+            (dep: {
+              target = dep.name;
+              source = name;
+              condition = dep.pcCondition;
+            })
+            beforeProcessDeps
+        )
+        allProcesses);
+    in
+    # Group by target process name
+    lib.foldl'
+      (acc: entry:
+        acc // {
+          ${entry.target} = (acc.${entry.target} or { }) // {
+            ${entry.source} = { condition = entry.condition; };
+          };
+        }
+      )
+      { }
+      contributions;
 in
 {
   options.process.managers.process-compose = {
@@ -114,7 +148,7 @@ in
 
         # Start a new process-compose server
         ${lib.getExe cfg.package} \
-          ${lib.cli.toGNUCommandLineShell { } config.process.manager.args} \
+          ${(lib.cli.toCommandLineShellGNU or lib.cli.toGNUCommandLineShell) { } config.process.manager.args} \
           -t="''${PC_TUI_ENABLED:-${lib.boolToString cfg.tui.enable}}" \
           up "$@" &
       '';
@@ -143,7 +177,7 @@ in
             (name: value:
               let
                 command =
-                  if !value.enable then value.exec
+                  if !value.start.enable then value.exec
                   else if value.process-compose.is_elevated or false
                   then config.process.taskCommandsBase.${name}
                   else config.process.taskCommands.${name};
@@ -170,7 +204,7 @@ in
                 # Translate restart -> availability
                 typedAvailability = {
                   availability = {
-                    restart = value.restart.on;
+                    restart = if value.restart.on == "never" then "no" else value.restart.on;
                   } // lib.optionalAttrs (value.restart.max != null) {
                     max_restarts = value.restart.max;
                   };
@@ -178,13 +212,23 @@ in
 
                 # Escape hatch (environment handled separately)
                 pcAttrs = removeAttrs value.process-compose [ "environment" ];
+
+                # Merge depends_on from `before` lists of other processes.
+                # after-derived deps (existingDepsOn) take precedence over before-derived deps
+                # when the same source process appears in both.
+                beforeDeps = beforeDepsMap.${name} or { };
+                existingDepsOn = pcAttrs.depends_on or { };
+                mergedDepsOn = beforeDeps // existingDepsOn;
+                pcAttrsWithBefore = pcAttrs // lib.optionalAttrs (mergedDepsOn != { }) {
+                  depends_on = mergedDepsOn;
+                };
               in
               { inherit command; }
               // typedAvailability
               // typedProbe
-              // pcAttrs
+              // pcAttrsWithBefore
               // { environment = envList ++ pcEnv; }
-              // lib.optionalAttrs (!value.enable) { disabled = true; }
+              // lib.optionalAttrs (!value.start.enable) { disabled = true; }
             )
             config.processes;
         };

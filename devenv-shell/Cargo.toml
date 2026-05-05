@@ -9,34 +9,43 @@ description = "Shell and PTY management for devenv"
 
 [dependencies]
 # PTY management
-portable-pty = { workspace = true }
+portable-pty.workspace = true
 
 # Terminal handling
-crossterm = { workspace = true }
-iocraft = { workspace = true }
-term_size = "0.3"
+crossterm.workspace = true
+iocraft.workspace = true
 
 # Terminal state tracking
-avt = "0.14"
+libghostty-vt.workspace = true
+# Direct dep required to enable the `pkg-config` feature on libghostty-vt-sys.
+# Without it, libghostty-vt pulls libghostty-vt-sys with default features and
+# its build.rs invokes `zig build`, which fails when zig is not installed.
+libghostty-vt-sys.workspace = true
 
 # Async runtime
-tokio = { workspace = true, features = ["sync", "rt"] }
+tokio = { workspace = true, features = ["sync", "rt", "signal", "io-util"] }
+
+# Shell escaping
+shell-escape.workspace = true
 
 # Error handling
-thiserror = { workspace = true }
+thiserror.workspace = true
 
 # Logging
-tracing = { workspace = true }
-
-# ANSI stripping
-strip-ansi-escapes = { workspace = true }
+tracing.workspace = true
 
 [target.'cfg(unix)'.dependencies]
-libc = "0.2"
+libc.workspace = true
 
 [dev-dependencies]
-regex = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
-tokio-test = "0.4"
-tempfile = { workspace = true }
-insta = { workspace = true }
+insta.workspace = true
+
+[features]
+default = []
+deterministic-tui = []
+test-all = ["test-pty", "deterministic-tui"]
+test-pty = []
+
+[package.metadata.cargo-machete]
+ignored = ["libghostty-vt-sys"]

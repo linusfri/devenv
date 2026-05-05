@@ -5,9 +5,16 @@
 //! hooks, and launch arguments.
 
 mod bash;
+mod fish;
+mod nushell;
+mod zsh;
 
 pub use bash::BashDialect;
+pub use fish::FishDialect;
+pub use nushell::NushellDialect;
+pub use zsh::ZshDialect;
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 /// Shell-specific behavior for interactive sessions.
@@ -26,20 +33,29 @@ pub trait ShellDialect: Send + Sync {
     /// Generate environment diff helper functions (for hot-reload tracking).
     fn env_diff_helpers(&self) -> &str;
 
-    /// Generate the hot-reload hook script (keybinding + prompt hook).
+    /// Generate the hot-reload hook script (prompt hook).
     fn reload_hook(&self, reload_file: &Path) -> String;
-
-    /// Shell-specific command to disable history recording.
-    fn disable_history(&self) -> &str;
-
-    /// Shell-specific command to enable history recording.
-    fn enable_history(&self) -> &str;
 
     /// Path to the user's shell rc file (e.g., ~/.bashrc, ~/.zshrc).
     fn user_rcfile(&self) -> Option<PathBuf>;
 
     /// Generate a shell-specific PS1/prompt prefix for "(devenv)".
     fn prompt_prefix(&self) -> &str;
+
+    /// Format task exports as shell export statements.
+    ///
+    /// Keys are already sorted (BTreeMap), giving deterministic output (important for direnv diffing).
+    fn format_task_exports(&self, exports: &BTreeMap<String, String>) -> String;
+
+    /// Format task messages as shell print statements.
+    fn format_task_messages(&self, messages: &[String]) -> String;
+
+    /// Write supplementary init files (e.g., zsh's ZDOTDIR .zshrc).
+    /// Default implementation is a no-op (bash doesn't need extra files).
+    fn write_init_files(&self, ctx: &RcfileContext) -> std::io::Result<()> {
+        let _ = ctx;
+        Ok(())
+    }
 }
 
 /// Arguments for launching an interactive shell with a custom init script.
@@ -50,6 +66,61 @@ pub struct InteractiveArgs {
     pub suffix: Vec<String>,
 }
 
+/// Look up a dialect by name, defaulting to bash if no match.
+pub fn create_dialect(shell_name: &str) -> Box<dyn ShellDialect> {
+    match shell_name {
+        "zsh" => Box::new(ZshDialect),
+        "fish" => Box::new(FishDialect),
+        "nu" => Box::new(NushellDialect),
+        "bash" => Box::new(BashDialect),
+        other => {
+            tracing::warn!(
+                shell = other,
+                "unrecognized shell dialect, falling back to bash"
+            );
+            Box::new(BashDialect)
+        }
+    }
+}
+
+/// Return `$XDG_CONFIG_HOME`, falling back to `$HOME/.config`.
+pub(crate) fn xdg_config_home() -> Option<PathBuf> {
+    std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
+}
+
+/// Generate the bash subprocess script used during hot-reload.
+///
+/// This script reverses the previous env diff, sources the new devenv
+/// environment, computes a new diff, and outputs `export -p` for the
+/// calling shell to parse.
+pub(crate) fn bash_reload_subprocess_script(env_diff_helpers: &str, reload_file: &str) -> String {
+    format!(
+        r#"{env_diff_helpers}
+
+# Reverse previous diff
+__devenv_apply_reverse_diff
+
+# Capture env before sourcing new devenv
+_before=$(mktemp)
+__devenv_capture_env > "$_before"
+
+# Source new devenv environment
+source "{reload_file}"
+rm -f "{reload_file}"
+
+# Compute new diff
+__devenv_compute_diff "$_before"
+rm -f "$_before"
+
+# Output current environment for the calling shell to parse
+export -p"#,
+        env_diff_helpers = env_diff_helpers,
+        reload_file = reload_file,
+    )
+}
+
 /// Context passed to [`ShellDialect::rcfile_content`] for generating the init script.
 pub struct RcfileContext<'a> {
     /// Path to the devenv environment script to source.
@@ -58,4 +129,8 @@ pub struct RcfileContext<'a> {
     pub env_diff_helpers: &'a str,
     /// Reload hook script (empty if no reload).
     pub reload_hook: &'a str,
+    /// Path to the target shell binary (e.g., /usr/bin/zsh). None for bash (no exec needed).
+    pub target_shell_path: Option<&'a str>,
+    /// Directory for writing shell init files (e.g., .devenv/).
+    pub init_dir: &'a Path,
 }

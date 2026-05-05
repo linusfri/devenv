@@ -17,6 +17,53 @@
 [![Version](https://img.shields.io/github/v/release/cachix/devenv?color=green&label=version&sort=semver)](https://github.com/cachix/devenv/releases)
 [![CI](https://github.com/cachix/devenv/actions/workflows/release.yml/badge.svg)](https://github.com/cachix/devenv/actions/workflows/release.yml?branch=main)
 
+## Features
+
+### Developer experience
+
+- **[Terminal UI](https://devenv.sh/blog/2025/03/05/devenv-v20-a-fresh-interface-to-nix/#terminal-ui)** with live build progress, task hierarchy, and error details
+- **[Native shell reloading](https://devenv.sh/blog/2025/03/05/devenv-v20-a-fresh-interface-to-nix/#native-shell-reloading)** that rebuilds in the background while your shell stays interactive
+- **[Instant environments](https://devenv.sh/blog/2024/10/03/devenv-13-instant-developer-environments-with-nix-caching/)** with incremental Nix evaluation caching (sub 100ms when nothing changed)
+- **[LSP for devenv.nix](https://devenv.sh/lsp/)** with autocomplete, hover docs, and go to definition via bundled nixd
+- **[Ad hoc environments](https://devenv.sh/ad-hoc-developer-environments/)** from the CLI without any config files (`--option languages.rust.enable:bool true`)
+- **[Out of tree devenvs](https://devenv.sh/ad-hoc-developer-environments/)** to use configs from other repos (`--from github:myorg/configs`)
+
+### Languages, packages, and services
+
+- **[50+ languages](https://devenv.sh/languages/)** with built in tooling: compilers, LSP servers, formatters, linters, and version selection
+- **[100,000+ packages](https://devenv.sh/packages/)** from Nixpkgs for Linux, macOS, x64, and ARM64 (including WSL2)
+- **[40+ services](https://devenv.sh/services/)** like PostgreSQL, Redis, MySQL, MongoDB, Elasticsearch, Caddy, and more
+
+### Processes and tasks
+
+- **[Native process manager](https://devenv.sh/processes/)** written in Rust with dependency ordering, restart policies, readiness probes (exec, HTTP, systemd notify), socket activation, watchdog heartbeats, and file watching
+- **[Automatic port allocation](https://devenv.sh/processes/#automatic-port-allocation)** that finds free ports so parallel environments never collide
+- **[Tasks](https://devenv.sh/tasks/)** with DAG based execution, caching, parallel runs, and namespace support
+- **[Scripts](https://devenv.sh/scripts/)** with access to all environment packages
+
+### Packaging and deployment
+
+- **[OCI containers](https://devenv.sh/containers/)** built from your environment without Docker
+- **[Outputs](https://devenv.sh/outputs/)** for packaging apps using each language's best tools (crate2nix, uv2nix, ...)
+- **[Polyrepo support](https://devenv.sh/guides/polyrepo/)** to reference outputs and options across repositories
+
+### Composition and configuration
+
+- **[Profiles](https://devenv.sh/profiles/)** for environment variants (`--profile backend --profile testing`)
+- **[Composable via imports](https://devenv.sh/composing-using-imports/)** to share and reuse environments across projects
+- **[Inputs](https://devenv.sh/inputs/)** for pinning and overriding Nix dependencies
+
+### Security and integrations
+
+- **[SecretSpec](https://devenv.sh/integrations/secretspec/)** for declarative, provider agnostic secrets management (keyring, 1Password, dotenv)
+- **[Git hooks](https://devenv.sh/git-hooks/)** via git-hooks.nix with pre configured formatters and linters
+- **[Testing](https://devenv.sh/tests/)** with `devenv test` that automatically starts and stops processes
+- **[direnv integration](https://devenv.sh/integrations/direnv/)** for automatic shell activation when entering a directory
+- **[MCP server](https://devenv.sh/mcp/)** for AI assistant integration (package and option search)
+- **[AI generation](https://devenv.new)** to scaffold environments from a natural language description
+
+## Quick start
+
 Running ``devenv init`` generates ``devenv.nix``:
 
 ```nix
@@ -81,66 +128,136 @@ And ``devenv shell`` activates the environment.
 
 ```
 $ devenv
-https://devenv.sh 1.9.0: Fast, Declarative, Reproducible, and Composable Developer Environments
+https://devenv.sh 2.0.0: Fast, Declarative, Reproducible, and Composable Developer Environments
 
 Usage: devenv [OPTIONS] [COMMAND]
 
 Commands:
-  init       Scaffold devenv.yaml, devenv.nix, .gitignore and .envrc.
-  generate   Generate devenv.yaml and devenv.nix using AI
-  shell      Activate the developer environment. https://devenv.sh/basics/
-  update     Update devenv.lock from devenv.yaml inputs. http://devenv.sh/inputs/
-  search     Search for packages and options in nixpkgs. https://devenv.sh/packages/#searching-for-a-file
-  info       Print information about this developer environment.
-  up         Start processes in the foreground. https://devenv.sh/processes/
-  processes  Start or stop processes. https://devenv.sh/processes/
-  tasks      Run tasks. https://devenv.sh/tasks/
-  test       Run tests. http://devenv.sh/tests/
-  container  Build, copy, or run a container. https://devenv.sh/containers/
-  inputs     Add an input to devenv.yaml. https://devenv.sh/inputs/
-  repl       Launch an interactive environment for inspecting the devenv configuration.
-  gc         Delete previous shell generations. See https://devenv.sh/garbage-collection
-  build      Build any attribute in devenv.nix.
-  direnvrc   Print a direnvrc that adds devenv support to direnv. See https://devenv.sh/integrations/direnv/.
-  version    Print the version of devenv.
-  mcp        Launch Model Context Protocol server for AI assistants
-  help       Print this message or the help of the given subcommand(s)
+  init        Scaffold devenv.yaml, devenv.nix, and .gitignore.
+  generate    Generate devenv.yaml and devenv.nix using AI
+  shell       Activate the developer environment. https://devenv.sh/basics/
+  update      Update devenv.lock from devenv.yaml inputs. http://devenv.sh/inputs/
+  search      Search for packages and options in nixpkgs. https://devenv.sh/packages/#searching-for-a-file
+  info        Print information about this developer environment.
+  up          Start processes in the foreground. https://devenv.sh/processes/
+  processes   Start or stop processes. https://devenv.sh/processes/
+  tasks       Run tasks. https://devenv.sh/tasks/
+  test        Run tests. http://devenv.sh/tests/
+  container   Build, copy, or run a container. https://devenv.sh/containers/
+  inputs      Add an input to devenv.yaml. https://devenv.sh/inputs/
+  changelogs  Show relevant changelogs.
+  repl        Launch an interactive environment for inspecting the devenv configuration.
+  gc          Delete previous shell generations. See https://devenv.sh/garbage-collection
+  build       Build any attribute in devenv.nix.
+  eval        Evaluate any attribute in devenv.nix and return JSON.
+  direnvrc    Print a direnvrc that adds devenv support to direnv. See https://devenv.sh/integrations/direnv/.
+  version     Print the version of devenv.
+  mcp         Launch Model Context Protocol server for AI assistants
+  lsp         Start the nixd language server for devenv.nix.
+  help        Print this message or the help of the given subcommand(s)
 
-Options:
-  -V, --version
-          Print version information and exit
+Input overrides:
+      --from <FROM>
+          Source for devenv.nix.
 
-  -v, --verbose
-          Enable additional debug logs.
+          Can be either a filesystem path (with path: prefix) or a flake input reference.
 
-  -q, --quiet
-          Silence all logs
+          Examples:
+            --from github:cachix/devenv
+            --from github:cachix/devenv?dir=examples/simple
+            --from path:/absolute/path/to/project
+            --from path:./relative/path
 
-      --log-format <LOG_FORMAT>
-          Configure the output format of the logs.
-          
-          [default: cli]
+  -o, --override-input <NAME> <URI>
+          Override inputs in devenv.yaml.
 
-          Possible values:
-          - cli:            The default human-readable log format used in the CLI
-          - tracing-full:   A verbose structured log format used for debugging
-          - tracing-pretty: A pretty human-readable log format used for debugging
+          Examples:
+            --override-input nixpkgs github:NixOS/nixpkgs/nixos-unstable
+            --override-input nixpkgs path:/path/to/local/nixpkgs
 
+  -O, --option <OPTION:TYPE> <VALUE>
+          Override configuration options with typed values.
+
+          OPTION must include a type: <attribute>:<type>
+          Supported types: string, int, float, bool, path, pkg, pkgs
+
+          List types (pkgs) append to existing values by default.
+          Add a ! suffix to replace instead: pkgs!
+
+          Examples:
+            --option languages.rust.channel:string beta
+            --option services.postgres.enable:bool true
+            --option languages.python.version:string 3.10
+            --option packages:pkgs "ncdu git"       (appends to packages)
+            --option packages:pkgs! "ncdu git"      (replaces all packages)
+
+Nix options:
   -j, --max-jobs <MAX_JOBS>
-          Maximum number of Nix builds at any time.
-          
-          [default: 8]
+          Maximum number of Nix builds to run concurrently.
+
+          Defaults to 1/4 of available CPU cores (minimum 1).
+
+          [env: DEVENV_MAX_JOBS=]
 
   -u, --cores <CORES>
-          Maximum number CPU cores being used by a single build.
-          
-          [default: 2]
+          Number of CPU cores available to each build.
+
+          Defaults to available cores divided by max-jobs (minimum 1).
+
+          [env: DEVENV_CORES=]
 
   -s, --system <SYSTEM>
-          [default: x86_64-linux]
+          Override the target system.
+
+          Defaults to the host system (e.g. aarch64-darwin, x86_64-linux).
 
   -i, --impure
           Relax the hermeticity of the environment.
+
+      --no-impure
+          Force a hermetic environment, overriding config.
+
+      --offline
+          Disable substituters and consider all previously downloaded files up-to-date.
+
+      --nix-option <NAME> <VALUE>
+          Pass additional options to nix commands.
+
+          These options are passed directly to Nix using the --option flag.
+          See `man nix.conf` for the full list of available options.
+
+          Examples:
+            --nix-option sandbox false
+            --nix-option keep-outputs true
+            --nix-option system x86_64-darwin
+
+      --nix-debugger
+          Enter the Nix debugger on failure.
+
+Shell options:
+  -c, --clean [<CLEAN>...]
+          Ignore existing environment variables when entering the shell. Pass a list of comma-separated environment variables to let through.
+
+  -P, --profile <PROFILES>
+          Activate one or more profiles defined in devenv.nix.
+
+          Profiles allow you to define different configurations that can be merged with your base configuration.
+
+          See https://devenv.sh/profiles for more information.
+
+          Examples:
+            --profile python-3.14
+            --profile backend --profile fast-startup
+
+      --reload
+          Enable auto-reload when config files change (default).
+
+      --no-reload
+          Disable auto-reload when config files change.
+
+Cache options:
+      --eval-cache
+          Enable caching of Nix evaluation results (default).
 
       --no-eval-cache
           Disable caching of Nix evaluation results.
@@ -148,58 +265,57 @@ Options:
       --refresh-eval-cache
           Force a refresh of the Nix evaluation cache.
 
-      --offline
-          Disable substituters and consider all previously downloaded files up-to-date.
+      --refresh-task-cache
+          Force a refresh of the task cache.
 
-  -c, --clean [<CLEAN>...]
-          Ignore existing environment variables when entering the shell. Pass a list of comma-separated environment variables to let through.
+Secretspec options:
+      --secretspec-provider <SECRETSPEC_PROVIDER>
+          Override the secretspec provider
 
-      --nix-debugger
-          Enter the Nix debugger on failure.
+          [env: SECRETSPEC_PROVIDER=]
 
-  -n, --nix-option <NAME> <VALUE>
-          Pass additional options to nix commands.
-          
-          These options are passed directly to Nix using the --option flag.
-          See `man nix.conf` for the full list of available options.
-          
-          Examples:
-            --nix-option sandbox false
-            --nix-option keep-outputs true
-            --nix-option system x86_64-darwin
+      --secretspec-profile <SECRETSPEC_PROFILE>
+          Override the secretspec profile
 
-  -o, --override-input <NAME> <URI>
-          Override inputs in devenv.yaml.
-          
-          Examples:
-            --override-input nixpkgs github:NixOS/nixpkgs/nixos-unstable
-            --override-input nixpkgs path:/path/to/local/nixpkgs
+          [env: SECRETSPEC_PROFILE=]
 
-  -O, --option <OPTION> <VALUE>
-          Override configuration options with typed values.
-          
-          OPTION must include a type: <attribute>:<type>
-          Supported types: string, int, float, bool, path, pkg, pkgs
-          
-          Examples:
-            --option languages.rust.channel:string beta
-            --option services.postgres.enable:bool true
-            --option languages.python.version:string 3.10
-            --option packages:pkgs "ncdu git"
+Tracing options:
+      --trace-output <TRACE_OUTPUT>
+          Enable tracing and set the output destination: stdout, stderr, or file:<path>. Tracing is disabled by default.
 
-  -P, --profile <PROFILE>
-          Activate one or more profiles defined in devenv.nix.
-          
-          Profiles allow you to define different configurations that can be merged with your base configuration.
-          
-          See https://devenv.sh/profiles for more information.
-          
-          Examples:
-            --profile python-3.14
-            --profile backend --profile fast-startup
+          [env: DEVENV_TRACE_OUTPUT=]
+
+      --trace-format <TRACE_FORMAT>
+          Set the trace output format. Only takes effect when tracing is enabled via --trace-output.
+
+          Possible values:
+          - full:   A verbose structured log format used for debugging
+          - json:   A JSON log format used for machine consumption
+          - pretty: A pretty human-readable log format used for debugging
+
+          [env: DEVENV_TRACE_FORMAT=]
+          [default: json]
+
+Global options:
+  -v, --verbose
+          Enable additional debug logs.
+
+  -q, --quiet
+          Silence all logs
+
+      --tui
+          Enable the interactive terminal interface (default when interactive).
+
+          [env: DEVENV_TUI=]
+
+      --no-tui
+          Disable the interactive terminal interface.
 
   -h, --help
           Print help (see a summary with '-h')
+
+  -V, --version
+          Print version information and exit
 ```
 
 ## Documentation

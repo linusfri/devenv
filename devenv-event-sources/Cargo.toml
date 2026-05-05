@@ -5,13 +5,23 @@ edition.workspace = true
 license.workspace = true
 description = "Reusable event sources for devenv (file watcher, TCP probe, notify socket)"
 
+[features]
+default = []
+macos-kqueue = ["notify/macos_kqueue"]
+
 [dependencies]
 async-priority-channel.workspace = true
 miette.workspace = true
-tokio = { workspace = true, features = ["net"] }
+notify = { workspace = true, optional = true }
+reqwest.workspace = true
+tokio = { workspace = true, features = ["net", "process"] }
 tracing.workspace = true
 watchexec.workspace = true
+watchexec-events = "6.1"
 watchexec-filterer-globset.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+
+[package.metadata.cargo-machete]
+ignored = ["notify"]

@@ -55,7 +55,7 @@ let
         (database:
           let
             psqlUserFlags =
-              if (database.user != null && database.pass != null)
+              if (database.user != null)
               then "--user ${database.user}"
               else "";
           in
@@ -69,22 +69,19 @@ let
             )"
             echo $dbAlreadyExists
             if [ 1 -ne "$dbAlreadyExists" ]; then
-              echo "Creating database: ${database.name}"
-              echo 'CREATE DATABASE "${database.name}";' | psql --dbname postgres
-              ${lib.optionalString (database.user != null && database.pass != null) ''
+              ${lib.optionalString (database.user != null) ''
               echo "Creating role ${database.user}..."
               psql --dbname postgres <<'EOF'
               DO $$
                   BEGIN
-                      CREATE ROLE "${database.user}" WITH LOGIN PASSWORD '${database.pass}';
+                      CREATE ROLE "${database.user}" WITH LOGIN${lib.optionalString (database.pass != null) " PASSWORD '${database.pass}'"};
                       EXCEPTION WHEN duplicate_object THEN RAISE NOTICE '%, skipping', SQLERRM USING ERRCODE = SQLSTATE;
                   END
               $$;
-              GRANT ALL PRIVILEGES ON DATABASE "${database.name}" TO "${database.user}";
-              \c ${database.name}
-              GRANT ALL PRIVILEGES ON SCHEMA public TO "${database.user}";
               EOF
             ''}
+              echo "Creating database: ${database.name}"
+              echo 'CREATE DATABASE "${database.name}"${lib.optionalString (database.user != null) " OWNER \"${database.user}\""};' | psql --dbname postgres
               if [ ${q database.initialSQL} != null ]
               then
                 echo "Running initial SQL on database ${database.name}"
@@ -331,14 +328,14 @@ in
             type = types.nullOr types.str;
             default = null;
             description = ''
-              Username of owner of the database (if null, the default $USER is used, only takes effect if `pass` is not `null`).
+              Username of owner of the database. If set, a role with this name is created and the database is owned by it. If null, the default $USER is used.
             '';
           };
           pass = lib.mkOption {
             type = types.nullOr types.str;
             default = null;
             description = ''
-              Password of owner of the database (only takes effect if `user` is not `null`).
+              Password of the database owner role. Requires `user` to be set.
             '';
           };
           initialSQL = lib.mkOption {
@@ -402,51 +399,78 @@ in
     };
   };
 
-  config = lib.mkIf cfg.enable {
-    packages = [ postgresPkg startScript ];
+  config = lib.mkMerge [
+    {
+      changelogs = [
+        {
+          date = "2026-03-16";
+          title = "services.postgres: initialDatabases now sets database owner";
+          when = cfg.enable;
+          description = ''
+            When `user` is specified in `services.postgres.initialDatabases`, the database is now created with that user as owner (`CREATE DATABASE ... OWNER`).
+            Previously the database was always owned by `$USER` regardless of the `user` option.
 
-    env.PGDATA = config.env.DEVENV_STATE + "/postgres";
-    env.PGHOST =
-      let
-        parsedAddress = headWithDefault null (parseListenAddresses cfg.listen_addresses);
-        host =
-          if cfg.listen_addresses != ""
-          then parsedAddress
-          else runtimeDir;
-      in
-      lib.mkDefault host;
-    # Required for init scripts.
-    env.PGPORT = allocatedPort;
+            Additionally, setting `pass` without `user` now triggers an assertion error.
+            Previously, `pass` without `user` was silently ignored.
+          '';
+        }
+      ];
+    }
+    (lib.mkIf cfg.enable {
+      assertions = lib.concatMap
+        (database: [
+          {
+            assertion = database.pass != null -> database.user != null;
+            message = "services.postgres.initialDatabases: database '${database.name}' has `pass` set but not `user`. Setting `pass` requires `user`.";
+          }
+        ])
+        cfg.initialDatabases;
 
-    services.postgres.settings = {
-      listen_addresses = cfg.listen_addresses;
-      port = allocatedPort;
-      unix_socket_directories = lib.mkDefault runtimeDir;
-    };
+      packages = [ postgresPkg startScript ];
 
-    processes.postgres = {
-      ports.main.allocate = basePort;
-      exec = "${startScript}/bin/start-postgres";
+      env.PGDATA = config.env.DEVENV_STATE + "/postgres";
+      env.PGHOST =
+        let
+          parsedAddress = headWithDefault null (parseListenAddresses cfg.listen_addresses);
+          host =
+            if cfg.listen_addresses != ""
+            then parsedAddress
+            else runtimeDir;
+        in
+        lib.mkDefault host;
+      # Required for init scripts.
+      env.PGPORT = allocatedPort;
 
-      ready = {
-        exec = ''
-          if [[ -f "$PGDATA/.devenv_initialized" ]]; then
-            ${postgresPkg}/bin/pg_isready -d template1 && \
-            ${postgresPkg}/bin/psql -c "SELECT 1" template1 > /dev/null 2>&1
-          else
-            echo "Waiting for PostgreSQL initialization to complete..." 2>&1
-            exit 1
-          fi
-        '';
-        initial_delay = 2;
-        probe_timeout = 4;
-        failure_threshold = 5;
+      services.postgres.settings = {
+        listen_addresses = cfg.listen_addresses;
+        port = allocatedPort;
+        unix_socket_directories = lib.mkDefault runtimeDir;
       };
 
-      process-compose = {
-        # SIGINT (= 2) for faster shutdown: https://www.postgresql.org/docs/current/server-shutdown.html
-        shutdown.signal = 2;
+      processes.postgres = {
+        ports.main.allocate = basePort;
+        exec = "${startScript}/bin/start-postgres";
+
+        ready = {
+          exec = ''
+            if [[ -f "$PGDATA/.devenv_initialized" ]]; then
+              ${postgresPkg}/bin/pg_isready -d template1 && \\
+              ${postgresPkg}/bin/psql -c "SELECT 1" template1 > /dev/null 2>&1
+            else
+              echo "Waiting for PostgreSQL initialization to complete..." 2>&1
+              exit 1
+            fi
+          '';
+          initial_delay = 2;
+          probe_timeout = 4;
+          failure_threshold = 5;
+        };
+
+        process-compose = {
+          # SIGINT (= 2) for faster shutdown: https://www.postgresql.org/docs/current/server-shutdown.html
+          shutdown.signal = 2;
+        };
       };
-    };
-  };
+    })
+  ];
 }

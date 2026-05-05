@@ -20,6 +20,10 @@ impl Database {
     /// * `path` - Path to the SQLite database file
     /// * `migrator` - The migrator containing database migrations to apply
     pub async fn new(path: PathBuf, migrator: &Migrator) -> CacheResult<Self> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+
         let options = connection_options(&path);
 
         let pool = SqlitePoolOptions::new()
@@ -88,7 +92,6 @@ fn connection_options(path: &Path) -> SqliteConnectOptions {
         .foreign_keys(true)
         .pragma("wal_autocheckpoint", "1000")
         .pragma("journal_size_limit", (64 * 1024 * 1024).to_string()) // 64 MB
-        .pragma("mmap_size", "134217728") // 128 MB
         .pragma("cache_size", "2000") // 2000 pages
 }
 

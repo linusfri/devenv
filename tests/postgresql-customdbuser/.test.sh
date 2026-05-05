@@ -5,6 +5,8 @@ wait_for_port 2345
 pg_isready -d template1
 
 # negative check (whether error handling in the test is reliable)
+# the following psql error is expected:
+echo "Expecting connection failure for non-existent user..."
 psql \
 	--set ON_ERROR_STOP=on \
 	--username=notexists \
@@ -12,6 +14,18 @@ psql \
 	--echo-all \
 	-c '\dt' && {
 	echo "Problem with error handling!!!"
+	exit 1
+}
+echo "OK: connection correctly rejected"
+
+# verify testuser owns the database
+psql \
+	--set ON_ERROR_STOP=on \
+	--tuples-only \
+	--dbname=testdb \
+	-c "SELECT 1 FROM pg_database WHERE datname = 'testdb' AND datdba = (SELECT oid FROM pg_roles WHERE rolname = 'testuser');" \
+	| grep -q '1' || {
+	echo "FAIL: testuser does not own testdb"
 	exit 1
 }
 

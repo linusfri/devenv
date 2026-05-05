@@ -9,11 +9,11 @@
 //! - Reports progress to the TUI via Activity
 
 use anyhow::{Context, Result, anyhow};
-use devenv_activity::Activity;
-use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, VecDeque};
+use devenv_activity::{Activity, activity};
+use devenv_core::nix_log_bridge::extract_package_name;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
-use std::process::Child;
+use std::process::{Child, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -78,26 +78,43 @@ impl DaemonConnectConfig {
     }
 }
 
-/// Real-time metrics for daemon push operations
+/// Real-time metrics for daemon push operations.
+///
+/// `in_progress` counts push requests the daemon has accepted but not
+/// yet `PushFinished` — *not* per-path. The daemon expands each request
+/// into its closure server-side and only emits per-path events for the
+/// missing subset, so any per-path "in progress" counter would be
+/// structurally wrong. `PushFinished` is the only event guaranteed once
+/// per request.
 #[derive(Debug, Clone)]
 pub struct DaemonMetrics {
-    /// Paths waiting in queue
+    /// Paths waiting in our local queue (not yet sent to the daemon).
     pub queued: u64,
-    /// Paths currently being uploaded
+    /// Push requests sent to the daemon but not yet acknowledged via `PushFinished`.
     pub in_progress: u64,
-    /// Paths successfully pushed
+    /// Running count of distinct paths the daemon has begun attempting
+    /// to push, deduped per request so retries don't double-count.
+    pub total_expected: u64,
+    /// Paths the daemon reported as successfully pushed.
     pub completed: u64,
-    /// Paths that failed to push
+    /// Paths the daemon reported as already cached (no upload performed).
+    pub skipped: u64,
+    /// Paths the daemon reported as failed.
     pub failed: u64,
-    /// Paths that encountered errors (failed + retried)
+    /// Failure reasons keyed by path.
     pub failed_with_reasons: Arc<Mutex<HashMap<String, String>>>,
 }
 
 impl DaemonMetrics {
     pub fn summary(&self) -> String {
         format!(
-            "Queued: {}, In Progress: {}, Completed: {}, Failed: {}",
-            self.queued, self.in_progress, self.completed, self.failed
+            "Queued: {}, In Progress: {}, Expected: {}, Completed: {}, Skipped: {}, Failed: {}",
+            self.queued,
+            self.in_progress,
+            self.total_expected,
+            self.completed,
+            self.skipped,
+            self.failed
         )
     }
 }
@@ -113,179 +130,7 @@ pub trait BuildPathCallback: Send + Sync {
     async fn on_build_complete(&self, path: &str, success: bool) -> Result<()>;
 }
 
-/// Request to push store paths to cachix
-#[derive(Serialize)]
-pub struct ClientPushRequest {
-    pub tag: String,
-    pub contents: PushRequestContents,
-}
-
-#[derive(Serialize)]
-pub struct PushRequestContents {
-    #[serde(rename = "storePaths")]
-    pub store_paths: Vec<String>,
-    #[serde(rename = "subscribeToUpdates")]
-    pub subscribe_to_updates: bool,
-}
-
-impl ClientPushRequest {
-    pub fn new(store_paths: Vec<String>, subscribe: bool) -> Self {
-        Self {
-            tag: "ClientPushRequest".to_string(),
-            contents: PushRequestContents {
-                store_paths,
-                subscribe_to_updates: subscribe,
-            },
-        }
-    }
-}
-
-// --- Protocol types matching the actual daemon wire format ---
-
-/// Top-level message from the daemon.
-/// The daemon sends `{"tag": "DaemonPushEvent", "contents": {...}}` or `{"tag": "DaemonPong"}`.
-#[derive(Debug, Deserialize)]
-struct DaemonMessage {
-    tag: String,
-    #[serde(default)]
-    contents: serde_json::Value,
-}
-
-/// Envelope for push events inside a `DaemonPushEvent`.
-/// Contains timestamp, push ID, and the inner event message.
-#[derive(Debug, Deserialize)]
-struct PushEventEnvelope {
-    #[serde(rename = "eventTimestamp")]
-    #[allow(dead_code)]
-    timestamp: String,
-    #[serde(rename = "eventPushId")]
-    #[allow(dead_code)]
-    push_id: String,
-    #[serde(rename = "eventMessage")]
-    message: DaemonMessage,
-}
-
-/// Parsed push event. Inner events use positional arrays (not named objects).
-#[derive(Debug, Clone)]
-pub enum PushEvent {
-    PushStarted,
-    StorePathAttempt {
-        path: String,
-        nar_size: u64,
-        retry_count: u64,
-    },
-    StorePathProgress {
-        path: String,
-        current_bytes: u64,
-        delta_bytes: u64,
-    },
-    StorePathDone {
-        path: String,
-    },
-    StorePathFailed {
-        path: String,
-        reason: String,
-    },
-    PushFinished,
-    Unknown,
-}
-
-impl PushEvent {
-    /// Parse a push event from the inner `DaemonMessage` of a `PushEventEnvelope`.
-    /// Inner events use positional arrays for their contents.
-    fn parse(msg: &DaemonMessage) -> PushEvent {
-        match msg.tag.as_str() {
-            "PushStarted" => PushEvent::PushStarted,
-            "PushFinished" => PushEvent::PushFinished,
-            "PushStorePathAttempt" => {
-                let arr = match msg.contents.as_array() {
-                    Some(a) => a,
-                    None => return PushEvent::Unknown,
-                };
-                let path = arr
-                    .first()
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let nar_size = arr.get(1).and_then(|v| v.as_u64()).unwrap_or(0);
-                let retry_count = arr
-                    .get(2)
-                    .and_then(|v| v.get("retryCount"))
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0);
-                PushEvent::StorePathAttempt {
-                    path,
-                    nar_size,
-                    retry_count,
-                }
-            }
-            "PushStorePathProgress" => {
-                let arr = match msg.contents.as_array() {
-                    Some(a) => a,
-                    None => return PushEvent::Unknown,
-                };
-                let path = arr
-                    .first()
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let current_bytes = arr.get(1).and_then(|v| v.as_u64()).unwrap_or(0);
-                let delta_bytes = arr.get(2).and_then(|v| v.as_u64()).unwrap_or(0);
-                PushEvent::StorePathProgress {
-                    path,
-                    current_bytes,
-                    delta_bytes,
-                }
-            }
-            "PushStorePathDone" => {
-                let arr = match msg.contents.as_array() {
-                    Some(a) => a,
-                    None => return PushEvent::Unknown,
-                };
-                let path = arr
-                    .first()
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                PushEvent::StorePathDone { path }
-            }
-            "PushStorePathFailed" => {
-                let arr = match msg.contents.as_array() {
-                    Some(a) => a,
-                    None => return PushEvent::Unknown,
-                };
-                let path = arr
-                    .first()
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let reason = arr
-                    .get(1)
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("unknown error")
-                    .to_string();
-                PushEvent::StorePathFailed { path, reason }
-            }
-            _ => PushEvent::Unknown,
-        }
-    }
-}
-
-/// Extract a short display name from a Nix store path.
-/// `/nix/store/abc123-package-1.0` → `package-1.0`
-fn short_path_name(path: &str) -> &str {
-    path.rsplit('/')
-        .next()
-        .map(|basename| {
-            // Skip the hash prefix (32 chars + dash)
-            if basename.len() > 33 && basename.as_bytes()[32] == b'-' {
-                &basename[33..]
-            } else {
-                basename
-            }
-        })
-        .unwrap_or(path)
-}
+use crate::cachix_protocol::{ClientPushRequest, DaemonMessage, PushEvent, PushEventEnvelope};
 
 /// Low-level socket client for daemon communication
 struct SocketClient {
@@ -410,9 +255,30 @@ impl DaemonProcess {
             .arg(&config.socket_path)
             .arg(&config.cache_name);
 
-        let child = cmd
+        let mut child = cmd
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
             .spawn()
             .with_context(|| format!("Failed to spawn cachix daemon at {:?}", config.binary))?;
+
+        // Drain stderr in a background thread so daemon logs don't leak into the TUI.
+        if let Some(stderr) = child.stderr.take() {
+            std::thread::Builder::new()
+                .name("cachix-stderr".into())
+                .spawn(move || {
+                    use std::io::BufRead;
+                    let reader = std::io::BufReader::new(stderr);
+                    for line in reader.lines() {
+                        match line {
+                            Ok(line) => {
+                                tracing::debug!(target: "cachix_daemon", "{}", line);
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                })
+                .expect("failed to spawn cachix-stderr thread");
+        }
 
         let mut daemon = Self {
             child: Some(child),
@@ -436,11 +302,8 @@ impl DaemonProcess {
         let mut backoff = Duration::from_millis(100);
 
         while start.elapsed() < timeout {
-            if self.socket_path.exists() {
-                // Try to connect to verify it's ready
-                if UnixStream::connect(&self.socket_path).await.is_ok() {
-                    return Ok(());
-                }
+            if UnixStream::connect(&self.socket_path).await.is_ok() {
+                return Ok(());
             }
             tokio::time::sleep(backoff).await;
             backoff = (backoff * 2).min(Duration::from_secs(1));
@@ -512,11 +375,8 @@ pub struct OwnedDaemon {
 
 impl OwnedDaemon {
     /// Spawn daemon and connect client
-    pub async fn spawn(
-        config: DaemonSpawnConfig,
-        connection: ConnectionParams,
-        activity: Option<Activity>,
-    ) -> Result<Self> {
+    pub async fn spawn(config: DaemonSpawnConfig, connection: ConnectionParams) -> Result<Self> {
+        let cache_name = config.cache_name.clone();
         let socket_path = config.socket_path.clone();
         let process = DaemonProcess::spawn(&config).await?;
 
@@ -524,7 +384,7 @@ impl OwnedDaemon {
             socket_path,
             connection,
         };
-        let client = DaemonClient::connect(connect_config, activity).await?;
+        let client = DaemonClient::connect(connect_config, cache_name).await?;
 
         Ok(Self { process, client })
     }
@@ -549,7 +409,7 @@ impl OwnedDaemon {
         self.client.as_build_callback()
     }
 
-    /// Shutdown: wait for in-flight pushes, then stop daemon
+    /// Shutdown: wait for pending pushes to drain, then stop daemon
     pub async fn shutdown(self, timeout: Duration) -> Result<()> {
         self.client.wait_for_completion(timeout).await.ok();
         self.client.shutdown();
@@ -569,14 +429,27 @@ pub struct DaemonClient {
 struct AtomicMetrics {
     queued: AtomicU64,
     in_progress: AtomicU64,
+    total_expected: AtomicU64,
     completed: AtomicU64,
+    /// Paths the daemon reported as already in the cache (no upload needed).
+    skipped: AtomicU64,
     failed: AtomicU64,
     failed_with_reasons: Arc<Mutex<HashMap<String, String>>>,
 }
 
+impl AtomicMetrics {
+    fn report_progress(&self, activity: &Activity, current_path: Option<&str>) {
+        let done = self.completed.load(Ordering::SeqCst)
+            + self.skipped.load(Ordering::SeqCst)
+            + self.failed.load(Ordering::SeqCst);
+        let expected = self.total_expected.load(Ordering::SeqCst);
+        activity.progress(done, expected, current_path);
+    }
+}
+
 impl DaemonClient {
     /// Connect to an existing cachix daemon
-    pub async fn connect(config: DaemonConnectConfig, activity: Option<Activity>) -> Result<Self> {
+    pub async fn connect(config: DaemonConnectConfig, cache_name: String) -> Result<Self> {
         let client_id = Uuid::new_v4();
         tracing::debug!(client_id = %client_id, "Connecting to cachix daemon");
 
@@ -588,7 +461,9 @@ impl DaemonClient {
         let metrics = Arc::new(AtomicMetrics {
             queued: AtomicU64::new(0),
             in_progress: AtomicU64::new(0),
+            total_expected: AtomicU64::new(0),
             completed: AtomicU64::new(0),
+            skipped: AtomicU64::new(0),
             failed: AtomicU64::new(0),
             failed_with_reasons: Arc::new(Mutex::new(HashMap::new())),
         });
@@ -608,7 +483,7 @@ impl DaemonClient {
                     work_notify,
                     metrics,
                     config,
-                    activity,
+                    cache_name,
                 )
                 .await
             })
@@ -654,13 +529,16 @@ impl DaemonClient {
         DaemonMetrics {
             queued: self.metrics.queued.load(Ordering::SeqCst),
             in_progress: self.metrics.in_progress.load(Ordering::SeqCst),
+            total_expected: self.metrics.total_expected.load(Ordering::SeqCst),
             completed: self.metrics.completed.load(Ordering::SeqCst),
+            skipped: self.metrics.skipped.load(Ordering::SeqCst),
             failed: self.metrics.failed.load(Ordering::SeqCst),
             failed_with_reasons: Arc::clone(&self.metrics.failed_with_reasons),
         }
     }
 
-    /// Wait for all queued paths to complete
+    /// Wait until our queue is empty and the daemon has acknowledged
+    /// `PushFinished` for every push request we sent.
     pub async fn wait_for_completion(&self, timeout: Duration) -> Result<DaemonMetrics> {
         let start = Instant::now();
 
@@ -685,9 +563,16 @@ impl DaemonClient {
         work_notify: Arc<Notify>,
         metrics: Arc<AtomicMetrics>,
         config: DaemonConnectConfig,
-        activity: Option<Activity>,
+        cache_name: String,
     ) {
         let mut reconnect_backoff = Duration::from_millis(config.connection.reconnect_backoff_ms);
+        // TODO(cachix-ux): pushes run async to shell entry, so this spinner
+        // can render above the shell prompt for ongoing uploads — confusing
+        // UX. Options: (1) hide push activity from the TUI entirely and surface
+        // results via the post-exit summary only, (2) switch to a Process
+        // activity (no spinner, stable status line), or (3) render push
+        // state in the existing devenv-shell status line. Leaning (1).
+        let mut current_activity: Option<Activity> = None;
 
         loop {
             {
@@ -714,14 +599,32 @@ impl DaemonClient {
                 }
             }
 
+            if current_activity.is_none() && metrics.queued.load(Ordering::SeqCst) > 0 {
+                current_activity = Some(activity!(
+                    INFO,
+                    operation,
+                    format!("Pushing to {cache_name}")
+                ));
+            }
+
             let should_wait = Self::process_cycle(
                 client_id,
                 Arc::clone(&client),
                 Arc::clone(&pending_paths),
                 Arc::clone(&metrics),
-                activity.as_ref(),
+                current_activity.as_ref(),
             )
             .await;
+
+            // `should_wait` means process_cycle found nothing to send and no
+            // request is currently being read. Combined with nothing in
+            // progress at the daemon, that's true idle — drop the activity.
+            if should_wait
+                && current_activity.is_some()
+                && metrics.in_progress.load(Ordering::SeqCst) == 0
+            {
+                current_activity = None;
+            }
 
             if should_wait {
                 // Wait for work notification or timeout
@@ -744,21 +647,15 @@ impl DaemonClient {
         metrics: Arc<AtomicMetrics>,
         activity: Option<&Activity>,
     ) -> bool {
-        // Collect paths to send in this batch
-        let mut paths_to_send = Vec::new();
-        {
+        // Collect paths to send in this push request — capped to avoid
+        // overwhelming the daemon.
+        const MAX_PATHS_PER_REQUEST: usize = 100;
+        let paths_to_send: Vec<String> = {
             let mut queue = pending_paths.lock().await;
-            while let Some(path) = queue.pop_front() {
-                paths_to_send.push(path);
-                metrics.queued.fetch_sub(1, Ordering::SeqCst);
-                metrics.in_progress.fetch_add(1, Ordering::SeqCst);
-
-                // Send in small batches to avoid overwhelming daemon
-                if paths_to_send.len() >= 100 {
-                    break;
-                }
-            }
-        }
+            let n = queue.len().min(MAX_PATHS_PER_REQUEST);
+            metrics.queued.fetch_sub(n as u64, Ordering::SeqCst);
+            queue.drain(..n).collect()
+        };
 
         // If no work, wait for notification
         if paths_to_send.is_empty() {
@@ -775,103 +672,93 @@ impl DaemonClient {
                 for path in paths_to_send {
                     queue.push_front(path);
                     metrics.queued.fetch_add(1, Ordering::SeqCst);
-                    metrics.in_progress.fetch_sub(1, Ordering::SeqCst);
                 }
                 *client_lock = None; // Mark connection as dead
                 return true;
             }
 
-            // Read events for this push
-            Self::read_push_events(client, &metrics, &paths_to_send, activity).await;
+            metrics.in_progress.fetch_add(1, Ordering::SeqCst);
+            Self::read_push_events(client, &metrics, activity).await;
         }
 
         false // Don't wait, immediately process more work
     }
 
+    /// Read push events for one in-progress request until `PushFinished`,
+    /// EOF, or a read error. Decrements `in_progress` exactly once before
+    /// returning, regardless of exit reason — so a dropped or abnormally
+    /// terminated request can't leak the counter.
+    ///
+    /// Bumps `total_expected` on the *first* `StorePathAttempt` for each
+    /// path; retries re-fire `StorePathAttempt` with `retry_count > 0` and
+    /// must not double-count. This is the only client-visible signal for
+    /// closure size — the daemon resolves closures server-side and doesn't
+    /// emit a count.
     async fn read_push_events(
         client: &mut SocketClient,
         metrics: &Arc<AtomicMetrics>,
-        sent_paths: &[String],
         activity: Option<&Activity>,
     ) {
-        let mut paths_accounted = 0;
+        let mut attempted: HashSet<String> = HashSet::new();
 
         loop {
             match client.read_event().await {
-                Ok(Some(event)) => {
-                    match event {
-                        PushEvent::StorePathAttempt { ref path, .. } => {
-                            tracing::debug!(path = %path, "Attempting to push");
-                            if let Some(activity) = activity {
-                                let done = metrics.completed.load(Ordering::SeqCst)
-                                    + metrics.failed.load(Ordering::SeqCst);
-                                let expected = done
-                                    + metrics.in_progress.load(Ordering::SeqCst)
-                                    + metrics.queued.load(Ordering::SeqCst);
-                                activity.progress(done, expected, Some(short_path_name(path)));
-                            }
+                Ok(Some(event)) => match event {
+                    PushEvent::StorePathAttempt { ref path, .. } => {
+                        tracing::debug!(path = %path, "Attempting to push");
+                        if attempted.insert(path.clone()) {
+                            metrics.total_expected.fetch_add(1, Ordering::SeqCst);
                         }
-                        PushEvent::StorePathProgress {
-                            ref path,
-                            current_bytes,
-                            ..
-                        } => {
-                            tracing::debug!(path = %path, current_bytes, "Upload progress");
+                        if let Some(activity) = activity {
+                            let name = extract_package_name(path);
+                            metrics.report_progress(activity, Some(&name));
                         }
-                        PushEvent::StorePathDone { ref path } => {
-                            tracing::info!(path = %path, "Push successful");
-                            metrics.completed.fetch_add(1, Ordering::SeqCst);
-                            metrics.in_progress.fetch_sub(1, Ordering::SeqCst);
-                            paths_accounted += 1;
-
-                            if let Some(activity) = activity {
-                                let done = metrics.completed.load(Ordering::SeqCst)
-                                    + metrics.failed.load(Ordering::SeqCst);
-                                let expected = done
-                                    + metrics.in_progress.load(Ordering::SeqCst)
-                                    + metrics.queued.load(Ordering::SeqCst);
-                                activity.progress(done, expected, None);
-                            }
-                        }
-                        PushEvent::StorePathFailed {
-                            ref path,
-                            ref reason,
-                        } => {
-                            tracing::warn!(path = %path, reason = %reason, "Push failed");
-                            metrics.failed.fetch_add(1, Ordering::SeqCst);
-                            metrics.in_progress.fetch_sub(1, Ordering::SeqCst);
-
-                            // Store failure reason for user visibility
-                            if let Ok(mut failed_map) = metrics.failed_with_reasons.try_lock() {
-                                failed_map.insert(path.clone(), reason.clone());
-                            }
-
-                            if let Some(activity) = activity {
-                                activity.error(format!("{}: {}", path, reason));
-                                let done = metrics.completed.load(Ordering::SeqCst)
-                                    + metrics.failed.load(Ordering::SeqCst);
-                                let expected = done
-                                    + metrics.in_progress.load(Ordering::SeqCst)
-                                    + metrics.queued.load(Ordering::SeqCst);
-                                activity.progress(done, expected, None);
-                            }
-
-                            paths_accounted += 1;
-                        }
-                        PushEvent::PushFinished => {
-                            tracing::info!("Push batch completed");
-                            break;
-                        }
-                        _ => {}
                     }
+                    PushEvent::StorePathProgress {
+                        ref path,
+                        current_bytes,
+                        ..
+                    } => {
+                        tracing::debug!(path = %path, current_bytes, "Upload progress");
+                    }
+                    PushEvent::StorePathDone { ref path } => {
+                        tracing::info!(path = %path, "Push successful");
+                        metrics.completed.fetch_add(1, Ordering::SeqCst);
+                        if let Some(activity) = activity {
+                            metrics.report_progress(activity, None);
+                        }
+                    }
+                    PushEvent::StorePathSkipped { ref path } => {
+                        tracing::debug!(path = %path, "Already cached, skipped");
+                        metrics.skipped.fetch_add(1, Ordering::SeqCst);
+                        if let Some(activity) = activity {
+                            metrics.report_progress(activity, None);
+                        }
+                    }
+                    PushEvent::StorePathFailed {
+                        ref path,
+                        ref reason,
+                    } => {
+                        tracing::warn!(path = %path, reason = %reason, "Push failed");
+                        metrics.failed.fetch_add(1, Ordering::SeqCst);
+                        metrics
+                            .failed_with_reasons
+                            .lock()
+                            .await
+                            .insert(path.clone(), reason.clone());
 
-                    // If we've accounted for all paths, consider batch done
-                    if paths_accounted >= sent_paths.len() {
+                        if let Some(activity) = activity {
+                            activity.error(format!("{}: {}", path, reason));
+                            metrics.report_progress(activity, None);
+                        }
+                    }
+                    PushEvent::PushFinished => {
+                        tracing::info!("Push request completed");
                         break;
                     }
-                }
+                    _ => {}
+                },
                 Ok(None) => {
-                    // EOF or non-push message from daemon
                     tracing::warn!("Daemon connection lost during event reading");
                     break;
                 }
@@ -881,6 +768,8 @@ impl DaemonClient {
                 }
             }
         }
+
+        metrics.in_progress.fetch_sub(1, Ordering::SeqCst);
     }
 
     pub fn as_build_callback(&self) -> ClientCallback {
@@ -929,30 +818,9 @@ impl BuildPathCallback for ClientCallback {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_push_request_serialization() {
-        let request =
-            ClientPushRequest::new(vec!["/nix/store/abc123-package-1.0".to_string()], true);
-        let json = serde_json::to_string(&request).unwrap();
-        assert!(json.contains("ClientPushRequest"));
-        assert!(json.contains("/nix/store/abc123-package-1.0"));
-    }
-
-    #[test]
-    fn test_push_request_multiple_paths() {
-        let request = ClientPushRequest::new(
-            vec![
-                "/nix/store/abc-1.0".to_string(),
-                "/nix/store/def-2.0".to_string(),
-            ],
-            false,
-        );
-        let json = serde_json::to_string(&request).unwrap();
-        assert!(json.contains("storePaths"));
-        assert!(json.contains("/nix/store/abc-1.0"));
-        assert!(json.contains("/nix/store/def-2.0"));
-        assert!(json.contains("\"subscribeToUpdates\":false"));
-    }
+    // Wire-protocol parsing/serialization tests live in
+    // `cachix_protocol::tests`. This module only covers daemon
+    // configuration and metrics shaping.
 
     #[test]
     fn test_spawn_config() {
@@ -1004,15 +872,19 @@ mod tests {
     fn test_metrics_summary_format() {
         let metrics = DaemonMetrics {
             queued: 10,
-            in_progress: 5,
+            in_progress: 2,
+            total_expected: 150,
             completed: 100,
+            skipped: 8,
             failed: 2,
             failed_with_reasons: Arc::new(Mutex::new(HashMap::new())),
         };
         let summary = metrics.summary();
         assert!(summary.contains("Queued: 10"));
-        assert!(summary.contains("In Progress: 5"));
+        assert!(summary.contains("In Progress: 2"));
+        assert!(summary.contains("Expected: 150"));
         assert!(summary.contains("Completed: 100"));
+        assert!(summary.contains("Skipped: 8"));
         assert!(summary.contains("Failed: 2"));
     }
 
@@ -1021,45 +893,15 @@ mod tests {
         let metrics = DaemonMetrics {
             queued: 0,
             in_progress: 0,
+            total_expected: 0,
             completed: 0,
+            skipped: 0,
             failed: 0,
             failed_with_reasons: Arc::new(Mutex::new(HashMap::new())),
         };
         let summary = metrics.summary();
         assert!(summary.contains("Queued: 0"));
         assert!(summary.contains("Completed: 0"));
-    }
-
-    #[test]
-    fn test_push_request_empty_paths() {
-        let request = ClientPushRequest::new(vec![], true);
-        let json = serde_json::to_string(&request).unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(
-            parsed["contents"]["storePaths"].as_array().unwrap().len(),
-            0
-        );
-    }
-
-    #[test]
-    fn test_push_request_roundtrip() {
-        let paths = vec![
-            "/nix/store/abc123-pkg".to_string(),
-            "/nix/store/def456-pkg".to_string(),
-        ];
-        let request = ClientPushRequest::new(paths.clone(), true);
-        let json = serde_json::to_string(&request).unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
-
-        assert_eq!(parsed["tag"], "ClientPushRequest");
-        assert_eq!(parsed["contents"]["subscribeToUpdates"], true);
-        let store_paths: Vec<String> = parsed["contents"]["storePaths"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|v| v.as_str().unwrap().to_string())
-            .collect();
-        assert_eq!(store_paths, paths);
     }
 
     #[test]
@@ -1071,189 +913,5 @@ mod tests {
             dry_run: false,
         };
         assert!(!config.dry_run);
-    }
-
-    // --- Protocol parsing tests using actual daemon wire format ---
-
-    /// Helper to build a DaemonPushEvent JSON string
-    fn push_event_json(tag: &str, contents: serde_json::Value) -> String {
-        serde_json::to_string(&serde_json::json!({
-            "tag": "DaemonPushEvent",
-            "contents": {
-                "eventTimestamp": "2024-01-01T00:00:00Z",
-                "eventPushId": "test-push-id",
-                "eventMessage": {
-                    "tag": tag,
-                    "contents": contents
-                }
-            }
-        }))
-        .unwrap()
-    }
-
-    fn parse_push_event(json: &str) -> PushEvent {
-        let msg: DaemonMessage = serde_json::from_str(json).unwrap();
-        assert_eq!(msg.tag, "DaemonPushEvent");
-        let envelope: PushEventEnvelope = serde_json::from_value(msg.contents).unwrap();
-        PushEvent::parse(&envelope.message)
-    }
-
-    #[test]
-    fn test_parse_push_started() {
-        let json = push_event_json("PushStarted", serde_json::json!([]));
-        let event = parse_push_event(&json);
-        assert!(matches!(event, PushEvent::PushStarted));
-    }
-
-    #[test]
-    fn test_parse_push_finished() {
-        let json = push_event_json("PushFinished", serde_json::json!([]));
-        let event = parse_push_event(&json);
-        assert!(matches!(event, PushEvent::PushFinished));
-    }
-
-    #[test]
-    fn test_parse_store_path_attempt() {
-        let json = push_event_json(
-            "PushStorePathAttempt",
-            serde_json::json!(["/nix/store/abc123-pkg", 1024, {"retryCount": 0}]),
-        );
-        let event = parse_push_event(&json);
-        match event {
-            PushEvent::StorePathAttempt {
-                path,
-                nar_size,
-                retry_count,
-            } => {
-                assert_eq!(path, "/nix/store/abc123-pkg");
-                assert_eq!(nar_size, 1024);
-                assert_eq!(retry_count, 0);
-            }
-            other => panic!("Expected StorePathAttempt, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn test_parse_store_path_attempt_with_retry() {
-        let json = push_event_json(
-            "PushStorePathAttempt",
-            serde_json::json!(["/nix/store/abc123-pkg", 2048, {"retryCount": 3}]),
-        );
-        let event = parse_push_event(&json);
-        match event {
-            PushEvent::StorePathAttempt { retry_count, .. } => {
-                assert_eq!(retry_count, 3);
-            }
-            other => panic!("Expected StorePathAttempt, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn test_parse_store_path_progress() {
-        let json = push_event_json(
-            "PushStorePathProgress",
-            serde_json::json!(["/nix/store/abc123-pkg", 512, 128]),
-        );
-        let event = parse_push_event(&json);
-        match event {
-            PushEvent::StorePathProgress {
-                path,
-                current_bytes,
-                delta_bytes,
-            } => {
-                assert_eq!(path, "/nix/store/abc123-pkg");
-                assert_eq!(current_bytes, 512);
-                assert_eq!(delta_bytes, 128);
-            }
-            other => panic!("Expected StorePathProgress, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn test_parse_store_path_done() {
-        let json = push_event_json(
-            "PushStorePathDone",
-            serde_json::json!(["/nix/store/abc123-pkg"]),
-        );
-        let event = parse_push_event(&json);
-        match event {
-            PushEvent::StorePathDone { path } => {
-                assert_eq!(path, "/nix/store/abc123-pkg");
-            }
-            other => panic!("Expected StorePathDone, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn test_parse_store_path_failed() {
-        let json = push_event_json(
-            "PushStorePathFailed",
-            serde_json::json!(["/nix/store/abc123-pkg", "upload timeout"]),
-        );
-        let event = parse_push_event(&json);
-        match event {
-            PushEvent::StorePathFailed { path, reason } => {
-                assert_eq!(path, "/nix/store/abc123-pkg");
-                assert_eq!(reason, "upload timeout");
-            }
-            other => panic!("Expected StorePathFailed, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn test_parse_unknown_event_tag() {
-        let json = push_event_json("SomeNewEvent", serde_json::json!([]));
-        let event = parse_push_event(&json);
-        assert!(matches!(event, PushEvent::Unknown));
-    }
-
-    #[test]
-    fn test_parse_daemon_pong_ignored() {
-        let json = r#"{"tag": "DaemonPong"}"#;
-        let msg: DaemonMessage = serde_json::from_str(json).unwrap();
-        assert_eq!(msg.tag, "DaemonPong");
-        // Non-push messages should be filtered at the read_event level (return None)
-        assert_ne!(msg.tag, "DaemonPushEvent");
-    }
-
-    #[test]
-    fn test_short_path_name() {
-        assert_eq!(
-            short_path_name("/nix/store/abcdef01234567890abcdef012345678-package-1.0"),
-            "package-1.0"
-        );
-        assert_eq!(short_path_name("/nix/store/short"), "short");
-        assert_eq!(short_path_name("bare-name"), "bare-name");
-    }
-
-    #[test]
-    fn test_parse_store_path_attempt_missing_fields() {
-        let json = push_event_json(
-            "PushStorePathAttempt",
-            serde_json::json!(["/nix/store/abc123-pkg"]),
-        );
-        let event = parse_push_event(&json);
-        match event {
-            PushEvent::StorePathAttempt {
-                path,
-                nar_size,
-                retry_count,
-            } => {
-                assert_eq!(path, "/nix/store/abc123-pkg");
-                assert_eq!(nar_size, 0);
-                assert_eq!(retry_count, 0);
-            }
-            other => panic!("Expected StorePathAttempt, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn test_parse_store_path_attempt_not_array() {
-        let json = push_event_json(
-            "PushStorePathAttempt",
-            serde_json::json!({"path": "/nix/store/abc123-pkg"}),
-        );
-        let event = parse_push_event(&json);
-        assert!(matches!(event, PushEvent::Unknown));
     }
 }

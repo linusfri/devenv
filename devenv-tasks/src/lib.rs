@@ -10,15 +10,12 @@ pub mod ui;
 
 pub use config::{Config, RunMode, TaskConfig};
 pub use error::Error;
-pub use executor::{
-    ExecutionContext, ExecutionResult, OutputCallback, PtyExecutor, SubprocessExecutor,
-    TaskExecutor, default_executor,
-};
+pub use executor::{ExecutionContext, ExecutionResult, OutputCallback};
 pub use privileges::SudoContext;
 pub use tasks::{Tasks, TasksBuilder, compute_display_hierarchy};
 pub use types::{
-    DependencyKind, Outputs, TaskCompleted, TaskOutputs, TaskStatus, TaskType, TasksStatus, UiMode,
-    VerbosityLevel, determine_ui_mode, is_tty,
+    DependencyKind, Outputs, PROCESS_TASK_PREFIX, TaskCompleted, TaskOutputs, TaskStatus, TaskType,
+    TasksStatus, UiMode, VerbosityLevel, determine_ui_mode, get_devenv_env, is_tty,
 };
 pub use ui::TasksUi;
 

@@ -2,7 +2,12 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+When creating git commits, add entry to CHANGELOG.md (skip for src/modules/* and docs/* and refactorings not affecting behavior):
+
 ## Build & Development Commands
+
+Use `devenv shell` to get a shell with Rust and all dependencies installed.
+Prefix commands with `devenv shell --` to run them directly.
 
 - **Build**: `cargo build`
 - **Run CLI**: `cargo run -- [args]`
@@ -11,8 +16,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - **Lint**: `cargo clippy`
 - **Run all tests**: `devenv-run-tests run tests`
 - **Run single test**: `devenv-run-tests run tests --only <test_name>`
-- **Run unit tests**: `cargo test`
-- **Run with nextest**: `cargo nextest run` (better process isolation)
+- **Run unit tests**: `cargo nextest run`
+- **Run unit tests (single crate)**: `cargo nextest run -p <crate_name>`
+- **Run all unit tests (including feature-gated)**: `cargo nextest run --features devenv/test-all`
 
 ## Architecture Overview
 
@@ -33,7 +39,7 @@ devenv is a Rust CLI tool that creates fast, declarative, reproducible developer
 
 - **devenv-tasks/** - DAG-based task execution system with caching, parallel execution, and privilege escalation support.
 
-- **devenv-activity/** - Tracing-based activity system that powers the TUI progress display. Use `#[activity("description")]` macro for TUI-visible operations.
+- **devenv-activity/** - Tracing-based activity system that powers the TUI progress display. Use `#[instrument_activity("description")]` macro for TUI-visible operations.
 
 - **devenv-tui/** - Terminal UI for displaying build progress and activities.
 
@@ -67,7 +73,7 @@ Nix modules in `src/modules/` define the devenv configuration schema:
 ### Key Patterns
 
 - **Dual Backend Architecture**: The `NixBackend` trait allows swapping between the FFI-based backend (default) and Snix backend.
-- **Activity Tracing**: Use `#[activity("description")]` macro or `Activity::operation()` for TUI-visible operations.
+- **Activity Tracing**: Use `#[instrument_activity("description")]` macro or `activity!(INFO, operation, "...")` for TUI-visible operations.
 - **Error Handling**: Use `miette` for errors with `bail!()` and `?`. Custom error types use `thiserror`.
 - **SQLite Migrations**: Both `devenv-eval-cache` and `devenv-tasks` use sqlx with migrations in `migrations/` directories.
 
@@ -81,46 +87,37 @@ Integration tests live in `tests/` and `examples/` directories. Each test is a d
   - `git_init: false` - Don't initialize git repo in temp dir
   - `supported_systems` / `broken_systems` - Platform filtering
 
-## Adding New CLI Subcommands
+### Cargo Feature Flags
 
-1. **Create implementation module** in `devenv/src/`:
-```rust
-// devenv/src/myfeature/mod.rs
-pub async fn run(devenv: &crate::Devenv, args: Args) -> miette::Result<()> {
-    Ok(())
-}
-```
+- **`devenv/test-all`** — Enables all feature-gated unit tests across the workspace.
+  Propagates to `devenv-processes/test-all`, `devenv-nix-backend/test-all`, `devenv-reload/test-all`, `devenv-shell/test-all`, and `devenv-tui/test-all`.
+- **`devenv/test-mcp`** — Enables MCP-related tests.
+- **`devenv/snix`** — Enables the experimental Snix backend.
+- **`devenv-shell/test-pty`** — Enables PTY-based session tests (requires a real terminal).
+- **`deterministic-tui`** — Available on both `devenv-shell` and `devenv-tui`.
+  Replaces spinner animation and elapsed time formatting with static placeholders (`[TIME]`, fixed spinner frame) so that TUI snapshot tests produce deterministic output.
+  Enabled automatically by `test-all` on both crates.
 
-2. **Add to CLI** in `devenv/src/cli.rs`:
-```rust
-#[derive(Subcommand, Clone)]
-pub enum MyFeatureCommand {
-    #[command(about = "Description.")]
-    Action { ... },
-}
-
-// Add to Commands enum:
-MyFeature {
-    #[command(subcommand)]
-    command: MyFeatureCommand,
-},
-```
-
-3. **Wire up** in `devenv/src/main.rs` `run_devenv()` function.
 
 ## Tracing / Debugging
 
-Tracing is disabled by default. Enable it with `--trace-output` to set the destination and optionally `--trace-format` to control the format:
+Tracing is disabled by default.
+Enable it with `--trace-to` using the syntax `[format:]destination`.
+Multiple outputs can be active simultaneously by repeating the flag.
 
-- **Trace to stderr**: `cargo run -- --trace-output stderr shell`
-- **Trace to file**: `cargo run -- --trace-output file:/tmp/devenv.log shell`
-- **Pretty format**: `cargo run -- --trace-output stderr --trace-format pretty shell`
-- **JSON format** (default): `cargo run -- --trace-output stderr --trace-format json shell`
-- **Full format**: `cargo run -- --trace-output stderr --trace-format full shell`
+- **Trace to stderr**: `cargo run -- --trace-to stderr shell`
+- **Trace to file**: `cargo run -- --trace-to file:/tmp/devenv.log shell`
+- **Pretty format**: `cargo run -- --trace-to pretty:stderr shell`
+- **JSON format** (default): `cargo run -- --trace-to json:stderr shell`
+- **Full format**: `cargo run -- --trace-to full:stderr shell`
+- **Multiple outputs**: `cargo run -- --trace-to pretty:stderr --trace-to json:file:/tmp/trace.json shell`
 
-When `--trace-output` is stdout or stderr, the TUI is automatically disabled (tracing mode).
+When format is omitted, defaults to json.
+When any output targets stdout or stderr, the TUI is automatically disabled.
 
-Environment variables `DEVENV_TRACE_OUTPUT` and `DEVENV_TRACE_FORMAT` can be used instead of CLI flags.
+Environment variable `DEVENV_TRACE_TO` accepts comma-separated specs (e.g. `DEVENV_TRACE_TO=pretty:stderr,json:file:/tmp/t.json`).
+
+Legacy flags `--trace-output` and `--trace-format` (env: `DEVENV_TRACE_OUTPUT`, `DEVENV_TRACE_FORMAT`) are still supported but hidden.
 
 ## Code Style
 
@@ -128,6 +125,40 @@ Environment variables `DEVENV_TRACE_OUTPUT` and `DEVENV_TRACE_FORMAT` can be use
 - **Naming**: `snake_case` for functions/variables, `CamelCase` for types
 - **Error Handling**: Use `bail!()` not `panic!()`, propagate with `?`
 - **No unsafe**: Don't use `unsafe` code
+
+## Docs
+
+When adding documentation in `docs/`, make sure to note the version the change was added in by checking `Cargo.toml`.
+
+    !!! tip "New in version X.Y.Y"
+
+## Changelog
+
+
+`CHANGELOG.md` follows this structure:
+
+```
+## <version> (unreleased)
+
+### Bug Fixes
+
+- Fixed <description> ([#<issue>](https://github.com/cachix/devenv/issues/<issue>)).
+
+### Improvements
+
+- <Description of improvement>.
+
+### Breaking Changes
+
+- **<Name>**: <Description>.
+```
+
+When updating the changelog:
+1. Use `git log <last-release-commit>..HEAD` to find commits since the last release.
+2. Skip automated commits (e.g. `Auto generate ...`) and test-only commits.
+3. Group entries under **Bug Fixes**, **Improvements**, or **Breaking Changes**.
+4. Link GitHub issues when referenced in commit messages (search for `Fixes`/`Closes`/`#` in commit bodies).
+5. The unreleased section sits above the last release entry.
 
 ## Files That Should Not Be Edited
 

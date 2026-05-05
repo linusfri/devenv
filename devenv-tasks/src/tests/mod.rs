@@ -511,7 +511,7 @@ async fn test_refresh_task_cache_with_exec_if_modified() -> Result<(), Error> {
     let temp_dir = TempDir::new().unwrap();
     let db_path = temp_dir.path().join("tasks.db");
 
-    let test_file = tempfile::NamedTempFile::new()?;
+    let test_file = tempfile::NamedTempFile::new_in(temp_dir.path())?;
     let test_file_path = test_file.path().to_str().unwrap().to_string();
     fs::write(&test_file_path, "initial content").await?;
 
@@ -605,7 +605,7 @@ async fn test_exec_if_modified() -> Result<(), Error> {
     let db_path = temp_dir.path().join("tasks.db");
 
     // Create a dummy file that will be modified
-    let test_file = tempfile::NamedTempFile::new()?;
+    let test_file = tempfile::NamedTempFile::new_in(temp_dir.path())?;
     let test_file_path = test_file.path().to_str().unwrap().to_string();
 
     // Write initial content to ensure file exists
@@ -797,10 +797,10 @@ async fn test_exec_if_modified_multiple_files() -> Result<(), Error> {
     );
 
     // Create multiple files to monitor
-    let test_file1 = tempfile::NamedTempFile::new()?;
+    let test_file1 = tempfile::NamedTempFile::new_in(temp_dir.path())?;
     let test_file_path1 = test_file1.path().to_str().unwrap().to_string();
 
-    let test_file2 = tempfile::NamedTempFile::new()?;
+    let test_file2 = tempfile::NamedTempFile::new_in(temp_dir.path())?;
     let test_file_path2 = test_file2.path().to_str().unwrap().to_string();
 
     // Create a command script that writes valid JSON to the outputs file
@@ -1012,7 +1012,7 @@ async fn test_preserved_output_on_skip() -> Result<(), Error> {
     );
 
     // Create a test file to monitor
-    let test_file = tempfile::NamedTempFile::new()?;
+    let test_file = tempfile::NamedTempFile::new_in(temp_dir.path())?;
     let test_file_path = test_file.path().to_str().unwrap().to_string();
 
     // Write initial content
@@ -2409,13 +2409,13 @@ async fn test_dependency_failure() -> Result<(), Error> {
 
     let task_statuses = inspect_tasks(&tasks).await;
     let task_statuses_slice = &task_statuses.as_slice();
-    // With @complete semantics (default for oneshot), task_2 runs even if task_1 fails
-    // because @complete means "wait for task to finish" regardless of success/failure
+    // With @succeeded semantics (default for oneshot), task_2 does NOT run if task_1 fails
+    // because @succeeded means "wait for task to succeed"
     assert_matches!(
         *task_statuses_slice,
         [
             (task_1, TaskStatus::Completed(TaskCompleted::Failed(_, _))),
-            (task_2, TaskStatus::Completed(TaskCompleted::Success(_, _)))
+            (task_2, TaskStatus::Completed(TaskCompleted::DependencyFailed))
         ] if task_1 == "myapp:task_1" && task_2 == "myapp:task_2"
     );
 
@@ -3086,7 +3086,7 @@ async fn test_exec_if_modified_command_change() -> Result<(), Error> {
     let db_path = temp_dir.path().join("tasks.db");
 
     // Create a watched file that won't change throughout the test
-    let watched_file = tempfile::NamedTempFile::new()?;
+    let watched_file = tempfile::NamedTempFile::new_in(temp_dir.path())?;
     let watched_file_path = watched_file.path().to_str().unwrap().to_string();
     fs::write(&watched_file_path, "unchanged content").await?;
 
@@ -3199,6 +3199,94 @@ echo "Command v2 executed"
     Ok(())
 }
 
+/// Test that command path changes invalidate cache even when exec_if_modified contains
+/// negation patterns that would otherwise match shell scripts.
+#[tokio::test]
+async fn test_exec_if_modified_command_change_with_negation() -> Result<(), Error> {
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("tasks.db");
+
+    let watched_file = tempfile::NamedTempFile::new_in(temp_dir.path())?;
+    let watched_file_path = watched_file.path().to_str().unwrap().to_string();
+    fs::write(&watched_file_path, "unchanged content").await?;
+
+    let task_name = format!(
+        "exec_mod:cmd_change_negated:{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis()
+    );
+
+    let command_script1 = create_script(
+        r#"#!/bin/sh
+echo '{"version": 1}' > $DEVENV_TASK_OUTPUT_FILE
+"#,
+    )?;
+    let command1 = command_script1.to_str().unwrap();
+
+    let command_script2 = create_script(
+        r#"#!/bin/sh
+echo '{"version": 2}' > $DEVENV_TASK_OUTPUT_FILE
+"#,
+    )?;
+    let command2 = command_script2.to_str().unwrap();
+
+    let config = |command: &str| {
+        Config::try_from(json!({
+            "roots": [task_name],
+            "run_mode": "all",
+            "tasks": [{
+                "name": task_name,
+                "command": command,
+                "exec_if_modified": [watched_file_path, "!**/*.sh"]
+            }]
+        }))
+        .unwrap()
+    };
+
+    let tasks1 = Tasks::builder(config(command1), VerbosityLevel::Verbose, Shutdown::new())
+        .with_db_path(db_path.clone())
+        .build()
+        .await?;
+    tasks1.run(false).await;
+    assert_matches!(
+        &tasks1.graph[tasks1.tasks_order[0]].read().await.status,
+        TaskStatus::Completed(TaskCompleted::Success(_, _))
+    );
+
+    let tasks2 = Tasks::builder(config(command1), VerbosityLevel::Verbose, Shutdown::new())
+        .with_db_path(db_path.clone())
+        .build()
+        .await?;
+    tasks2.run(false).await;
+    assert_matches!(
+        &tasks2.graph[tasks2.tasks_order[0]].read().await.status,
+        TaskStatus::Completed(TaskCompleted::Skipped(_))
+    );
+
+    let tasks3 = Tasks::builder(config(command2), VerbosityLevel::Verbose, Shutdown::new())
+        .with_db_path(db_path)
+        .build()
+        .await?;
+    let outputs3 = tasks3.run(false).await;
+    assert_matches!(
+        &tasks3.graph[tasks3.tasks_order[0]].read().await.status,
+        TaskStatus::Completed(TaskCompleted::Success(_, _))
+    );
+
+    assert_eq!(
+        outputs3
+            .0
+            .get(&task_name)
+            .and_then(|v| v.get("version"))
+            .and_then(|v| v.as_i64()),
+        Some(2)
+    );
+
+    Ok(())
+}
+
 /// Test that RunMode::All doesn't include unrelated tasks connected through shared prerequisites.
 ///
 /// This reproduces GitHub issue #2337 where tasks with `before = ["enterShell", "enterTest"]`
@@ -3296,7 +3384,7 @@ async fn test_run_mode_all_excludes_unrelated_entry_points() -> Result<(), Error
     Ok(())
 }
 
-/// Test that @complete dependency does NOT propagate failure (soft dependency)
+/// Test that @completed dependency does NOT propagate failure (soft dependency)
 #[tokio::test]
 async fn test_complete_dependency_no_failure_propagation() -> Result<(), Error> {
     let temp_dir = TempDir::new().unwrap();
@@ -3304,7 +3392,7 @@ async fn test_complete_dependency_no_failure_propagation() -> Result<(), Error> 
 
     // Create a failing task
     let failing_script = create_script("#!/bin/sh\necho 'Failing task' && exit 1")?;
-    // Create a succeeding task that depends on the failing one with @complete
+    // Create a succeeding task that depends on the failing one with @completed
     let success_script = create_script("#!/bin/sh\necho 'Success task ran'")?;
 
     let tasks = Tasks::builder(
@@ -3318,7 +3406,7 @@ async fn test_complete_dependency_no_failure_propagation() -> Result<(), Error> 
                 },
                 {
                     "name": "soft:dependent",
-                    "after": ["soft:failing@complete"],
+                    "after": ["soft:failing@completed"],
                     "command": success_script.to_str().unwrap()
                 }
             ]
@@ -3366,7 +3454,7 @@ async fn test_ready_dependency_failure_propagation() -> Result<(), Error> {
 
     // Create a failing task
     let failing_script = create_script("#!/bin/sh\necho 'Failing task' && exit 1")?;
-    // Create a task that depends on the failing one with @ready
+    // Create a task that depends on the failing one with @succeeded (hard dependency)
     let success_script = create_script("#!/bin/sh\necho 'This should not run'")?;
 
     let tasks = Tasks::builder(
@@ -3380,7 +3468,7 @@ async fn test_ready_dependency_failure_propagation() -> Result<(), Error> {
                 },
                 {
                     "name": "ready:dependent",
-                    "after": ["ready:failing@ready"],
+                    "after": ["ready:failing@succeeded"],
                     "command": success_script.to_str().unwrap()
                 }
             ]
@@ -3420,7 +3508,7 @@ async fn test_ready_dependency_failure_propagation() -> Result<(), Error> {
     Ok(())
 }
 
-/// Test mixed dependencies: one @complete (soft) and one @ready (hard)
+/// Test mixed dependencies: one @completed (soft) and one @ready (hard)
 #[tokio::test]
 async fn test_mixed_dependencies() -> Result<(), Error> {
     let temp_dir = TempDir::new().unwrap();
@@ -3446,7 +3534,7 @@ async fn test_mixed_dependencies() -> Result<(), Error> {
                 },
                 {
                     "name": "mixed:dependent",
-                    "after": ["mixed:failing@complete", "mixed:success@ready"],
+                    "after": ["mixed:failing@completed", "mixed:success@succeeded"],
                     "command": dependent_script.to_str().unwrap()
                 }
             ]
@@ -3484,8 +3572,8 @@ async fn test_mixed_dependencies() -> Result<(), Error> {
     );
 
     // The dependent task should succeed because:
-    // - mixed:failing is a soft dependency (@complete) so its failure doesn't propagate
-    // - mixed:success is a hard dependency (@ready) and it succeeded
+    // - mixed:failing is a soft dependency (@completed) so its failure doesn't propagate
+    // - mixed:success is a hard dependency (@succeeded) and it succeeded
     let dependent_status = task_statuses
         .iter()
         .find(|(name, _)| name == "mixed:dependent")
@@ -3524,7 +3612,7 @@ async fn test_mixed_dependencies_hard_failure() -> Result<(), Error> {
                 },
                 {
                     "name": "mixed2:dependent",
-                    "after": ["mixed2:soft-fail@complete", "mixed2:hard-fail@ready"],
+                    "after": ["mixed2:soft-fail@completed", "mixed2:hard-fail@succeeded"],
                     "command": dependent_script.to_str().unwrap()
                 }
             ]
@@ -3554,13 +3642,13 @@ async fn test_mixed_dependencies_hard_failure() -> Result<(), Error> {
     Ok(())
 }
 
-/// Test that `before` with @complete suffix does NOT propagate failure
+/// Test that `before` with @completed suffix does NOT propagate failure
 #[tokio::test]
 async fn test_before_complete_dependency_no_failure_propagation() -> Result<(), Error> {
     let temp_dir = TempDir::new().unwrap();
     let db_path = temp_dir.path().join("tasks.db");
 
-    // Create a failing task that declares it runs before another task with @complete
+    // Create a failing task that declares it runs before another task with @completed
     let failing_script = create_script("#!/bin/sh\necho 'Failing task' && exit 1")?;
     // Create the main task that will be run
     let main_script = create_script("#!/bin/sh\necho 'Main task ran'")?;
@@ -3572,7 +3660,7 @@ async fn test_before_complete_dependency_no_failure_propagation() -> Result<(), 
             "tasks": [
                 {
                     "name": "before:failing",
-                    "before": ["before:main@complete"],
+                    "before": ["before:main@completed"],
                     "command": failing_script.to_str().unwrap()
                 },
                 {
@@ -3604,7 +3692,7 @@ async fn test_before_complete_dependency_no_failure_propagation() -> Result<(), 
     );
 
     // The main task should have succeeded (not marked as DependencyFailed)
-    // because the dependency was soft (@complete)
+    // because the dependency was soft (@completed)
     let main_status = task_statuses
         .iter()
         .find(|(name, _)| name == "before:main")
@@ -3617,7 +3705,7 @@ async fn test_before_complete_dependency_no_failure_propagation() -> Result<(), 
     Ok(())
 }
 
-/// Test chained soft dependencies: A (fails) --@complete--> B --@complete--> C
+/// Test chained soft dependencies: A (fails) --@completed--> B --@completed--> C
 /// C should still run even though A failed
 #[tokio::test]
 async fn test_chained_soft_dependencies() -> Result<(), Error> {
@@ -3639,12 +3727,12 @@ async fn test_chained_soft_dependencies() -> Result<(), Error> {
                 },
                 {
                     "name": "chain:b",
-                    "after": ["chain:a@complete"],
+                    "after": ["chain:a@completed"],
                     "command": middle_script.to_str().unwrap()
                 },
                 {
                     "name": "chain:c",
-                    "after": ["chain:b@complete"],
+                    "after": ["chain:b@completed"],
                     "command": final_script.to_str().unwrap()
                 }
             ]
@@ -3689,6 +3777,485 @@ async fn test_chained_soft_dependencies() -> Result<(), Error> {
     assert_matches!(
         c_status,
         Some(TaskStatus::Completed(TaskCompleted::Success(_, _)))
+    );
+
+    Ok(())
+}
+
+/// Test that has_failures() returns false when only @completed dependencies fail
+#[tokio::test]
+async fn test_soft_failure_no_exit_code() -> Result<(), Error> {
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("tasks.db");
+
+    let failing_script = create_script("#!/bin/sh\nexit 1")?;
+    let success_script = create_script("#!/bin/sh\necho ok")?;
+
+    let tasks = Tasks::builder(
+        Config::try_from(json!({
+            "roots": ["sf:root"],
+            "run_mode": "all",
+            "tasks": [
+                {
+                    "name": "sf:will-fail",
+                    "command": failing_script.to_str().unwrap()
+                },
+                {
+                    "name": "sf:root",
+                    "after": ["sf:will-fail@completed"],
+                    "command": success_script.to_str().unwrap()
+                }
+            ]
+        }))
+        .unwrap(),
+        VerbosityLevel::Verbose,
+        Shutdown::new(),
+    )
+    .with_db_path(db_path)
+    .build()
+    .await?;
+
+    tasks.run(false).await;
+
+    let status = tasks.get_completion_status().await;
+    assert_eq!(status.failed, 1);
+    assert_eq!(status.soft_failed, 1);
+    assert!(
+        !status.has_failures(),
+        "soft @completed failure should not count as a hard failure"
+    );
+
+    Ok(())
+}
+
+/// Test that has_failures() returns true when @ready dependencies fail
+#[tokio::test]
+async fn test_hard_failure_exit_code() -> Result<(), Error> {
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("tasks.db");
+
+    let failing_script = create_script("#!/bin/sh\nexit 1")?;
+    let success_script = create_script("#!/bin/sh\necho ok")?;
+
+    let tasks = Tasks::builder(
+        Config::try_from(json!({
+            "roots": ["hf:root"],
+            "run_mode": "all",
+            "tasks": [
+                {
+                    "name": "hf:will-fail",
+                    "command": failing_script.to_str().unwrap()
+                },
+                {
+                    "name": "hf:root",
+                    "after": ["hf:will-fail@succeeded"],
+                    "command": success_script.to_str().unwrap()
+                }
+            ]
+        }))
+        .unwrap(),
+        VerbosityLevel::Verbose,
+        Shutdown::new(),
+    )
+    .with_db_path(db_path)
+    .build()
+    .await?;
+
+    tasks.run(false).await;
+
+    let status = tasks.get_completion_status().await;
+    assert_eq!(status.failed, 1);
+    assert_eq!(status.soft_failed, 0);
+    assert_eq!(status.dependency_failed, 1);
+    assert_eq!(status.soft_dependency_failed, 0);
+    assert!(
+        status.has_failures(),
+        "@succeeded failure should count as a hard failure"
+    );
+
+    Ok(())
+}
+
+/// Test mixed case: @completed failure is soft, @succeeded failure is hard
+#[tokio::test]
+async fn test_mixed_soft_and_hard_failure_exit_code() -> Result<(), Error> {
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("tasks.db");
+
+    let failing_script = create_script("#!/bin/sh\nexit 1")?;
+    let success_script = create_script("#!/bin/sh\necho ok")?;
+
+    let tasks = Tasks::builder(
+        Config::try_from(json!({
+            "roots": ["mf:root"],
+            "run_mode": "all",
+            "tasks": [
+                {
+                    "name": "mf:soft-fail",
+                    "command": failing_script.to_str().unwrap()
+                },
+                {
+                    "name": "mf:hard-fail",
+                    "command": failing_script.to_str().unwrap()
+                },
+                {
+                    "name": "mf:root",
+                    "after": ["mf:soft-fail@completed", "mf:hard-fail@succeeded"],
+                    "command": success_script.to_str().unwrap()
+                }
+            ]
+        }))
+        .unwrap(),
+        VerbosityLevel::Verbose,
+        Shutdown::new(),
+    )
+    .with_db_path(db_path)
+    .build()
+    .await?;
+
+    tasks.run(false).await;
+
+    let status = tasks.get_completion_status().await;
+    // mf:soft-fail is soft (only @completed edges out), mf:hard-fail is hard (@succeeded edge out)
+    assert_eq!(status.failed, 2);
+    assert_eq!(status.soft_failed, 1);
+    assert!(
+        status.has_failures(),
+        "mix with @succeeded failure should count as hard failure"
+    );
+
+    Ok(())
+}
+
+/// Test that a root task failure is never soft, even if it has @completed edges
+#[tokio::test]
+async fn test_root_failure_never_soft() -> Result<(), Error> {
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("tasks.db");
+
+    let failing_script = create_script("#!/bin/sh\nexit 1")?;
+
+    let tasks = Tasks::builder(
+        Config::try_from(json!({
+            "roots": ["rf:root"],
+            "run_mode": "all",
+            "tasks": [
+                {
+                    "name": "rf:root",
+                    "command": failing_script.to_str().unwrap()
+                }
+            ]
+        }))
+        .unwrap(),
+        VerbosityLevel::Verbose,
+        Shutdown::new(),
+    )
+    .with_db_path(db_path)
+    .build()
+    .await?;
+
+    tasks.run(false).await;
+
+    let status = tasks.get_completion_status().await;
+    assert_eq!(status.failed, 1);
+    assert_eq!(status.soft_failed, 0);
+    assert!(
+        status.has_failures(),
+        "root task failure should always be hard"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_oneshot_rejects_ready_suffix() -> Result<(), Error> {
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("tasks.db");
+
+    let script = create_script("#!/bin/sh\ntrue")?;
+    let command = script.to_str().unwrap();
+
+    let config = Config::try_from(json!({
+        "roots": ["ns:consumer"],
+        "run_mode": "all",
+        "tasks": [
+            {
+                "name": "ns:oneshot",
+                "type": "oneshot",
+                "command": command
+            },
+            {
+                "name": "ns:consumer",
+                "type": "oneshot",
+                "command": command,
+                "after": ["ns:oneshot@ready"]
+            }
+        ]
+    }))
+    .unwrap();
+
+    let result = Tasks::builder(config, VerbosityLevel::Quiet, Shutdown::new())
+        .with_db_path(db_path)
+        .build()
+        .await;
+
+    assert!(result.is_err());
+    let err = result.unwrap_err().to_string();
+    assert!(
+        err.contains("is a oneshot task"),
+        "Expected oneshot error, got: {err}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_process_rejects_succeeded_suffix() -> Result<(), Error> {
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("tasks.db");
+
+    let script = create_script("#!/bin/sh\ntrue")?;
+    let command = script.to_str().unwrap();
+
+    let config = Config::try_from(json!({
+        "roots": ["ns:consumer"],
+        "run_mode": "all",
+        "tasks": [
+            {
+                "name": "ns:proc",
+                "type": "process",
+                "command": command
+            },
+            {
+                "name": "ns:consumer",
+                "type": "oneshot",
+                "command": command,
+                "after": ["ns:proc@succeeded"]
+            }
+        ]
+    }))
+    .unwrap();
+
+    let result = Tasks::builder(config, VerbosityLevel::Quiet, Shutdown::new())
+        .with_db_path(db_path)
+        .build()
+        .await;
+
+    assert!(result.is_err());
+    let err = result.unwrap_err().to_string();
+    assert!(
+        err.contains("is a process task"),
+        "Expected process error, got: {err}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_valid_suffix_combinations() -> Result<(), Error> {
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("tasks.db");
+
+    let script = create_script("#!/bin/sh\ntrue")?;
+    let command = script.to_str().unwrap();
+
+    // process@started, process@completed, oneshot@started, oneshot@succeeded, oneshot@completed
+    let config = Config::try_from(json!({
+        "roots": ["ns:a", "ns:b", "ns:c", "ns:d", "ns:e"],
+        "run_mode": "all",
+        "tasks": [
+            {
+                "name": "ns:proc",
+                "type": "process",
+                "command": command
+            },
+            {
+                "name": "ns:oneshot",
+                "type": "oneshot",
+                "command": command
+            },
+            {
+                "name": "ns:a",
+                "type": "oneshot",
+                "command": command,
+                "after": ["ns:proc@started"]
+            },
+            {
+                "name": "ns:b",
+                "type": "oneshot",
+                "command": command,
+                "after": ["ns:proc@completed"]
+            },
+            {
+                "name": "ns:c",
+                "type": "oneshot",
+                "command": command,
+                "after": ["ns:oneshot@started"]
+            },
+            {
+                "name": "ns:d",
+                "type": "oneshot",
+                "command": command,
+                "after": ["ns:oneshot@succeeded"]
+            },
+            {
+                "name": "ns:e",
+                "type": "oneshot",
+                "command": command,
+                "after": ["ns:oneshot@completed"]
+            }
+        ]
+    }))
+    .unwrap();
+
+    let result = Tasks::builder(config, VerbosityLevel::Quiet, Shutdown::new())
+        .with_db_path(db_path)
+        .build()
+        .await;
+
+    assert!(
+        result.is_ok(),
+        "Valid suffix combinations should build without error, got: {:?}",
+        result.err()
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_non_utf8_stdout() -> Result<(), Error> {
+    // Regression test for https://github.com/cachix/devenv/issues/2590
+    // A script that outputs invalid UTF-8 bytes should still complete
+    // successfully instead of deadlocking because the pipe stops being drained.
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("tasks.db");
+
+    let script = create_script(
+        r#"#!/bin/sh
+printf 'before\xff\xfebinary\n'
+echo 'after invalid bytes'
+"#,
+    )?;
+
+    let tasks = Tasks::builder(
+        Config::try_from(json!({
+            "roots": ["myapp:task_1"],
+            "run_mode": "all",
+            "tasks": [
+                {
+                    "name": "myapp:task_1",
+                    "command": script.to_str().unwrap()
+                }
+            ]
+        }))
+        .unwrap(),
+        VerbosityLevel::Verbose,
+        Shutdown::new(),
+    )
+    .with_db_path(db_path)
+    .build()
+    .await?;
+
+    tasks.run(false).await;
+
+    let task_statuses = inspect_tasks(&tasks).await;
+    let task_statuses = task_statuses.as_slice();
+    assert_matches!(
+        task_statuses,
+        [(name, TaskStatus::Completed(TaskCompleted::Success(_, _)))]
+        if name == "myapp:task_1"
+    );
+
+    Ok(())
+}
+
+/// Test that independent oneshot tasks run in parallel, not sequentially.
+/// Two tasks that both declare `before = ["root"]` but have no dependency on each other
+/// should run concurrently, so total time ≈ max(task_time) rather than sum(task_times).
+#[tokio::test]
+async fn test_independent_oneshot_tasks_run_in_parallel() -> Result<(), Error> {
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("tasks.db");
+
+    // Each task records its start/end timestamps (nanoseconds since epoch) to a file,
+    // with a sleep in between. If the tasks run in parallel, their time windows overlap.
+    let ts_a = temp_dir.path().join("timestamps_a");
+    let ts_b = temp_dir.path().join("timestamps_b");
+    let task_a = create_script(&format!(
+        "#!/bin/sh\npython3 -c 'import time; print(time.time())' > {ts}\nsleep 0.5\npython3 -c 'import time; print(time.time())' >> {ts}",
+        ts = ts_a.display()
+    ))?;
+    let task_b = create_script(&format!(
+        "#!/bin/sh\npython3 -c 'import time; print(time.time())' > {ts}\nsleep 0.5\npython3 -c 'import time; print(time.time())' >> {ts}",
+        ts = ts_b.display()
+    ))?;
+    let task_root = create_script("#!/bin/sh\ntrue")?;
+
+    let shutdown = Shutdown::new();
+
+    let tasks = Tasks::builder(
+        Config::try_from(json!({
+            "roots": ["test:root"],
+            "run_mode": "all",
+            "tasks": [
+                {
+                    "name": "test:task_a",
+                    "command": task_a.to_str().unwrap(),
+                    "before": ["test:root"]
+                },
+                {
+                    "name": "test:task_b",
+                    "command": task_b.to_str().unwrap(),
+                    "before": ["test:root"]
+                },
+                {
+                    "name": "test:root",
+                    "command": task_root.to_str().unwrap()
+                }
+            ]
+        }))
+        .unwrap(),
+        VerbosityLevel::Verbose,
+        shutdown.clone(),
+    )
+    .with_db_path(db_path)
+    .build()
+    .await?;
+
+    tasks.run(false).await;
+
+    // All tasks should succeed
+    let task_statuses = inspect_tasks(&tasks).await;
+    for (name, status) in &task_statuses {
+        assert_matches!(
+            status,
+            TaskStatus::Completed(TaskCompleted::Success(_, _)),
+            "Task {} should succeed",
+            name
+        );
+    }
+
+    // Parse start/end timestamps from each task's file
+    let parse_timestamps = |path: &std::path::Path| -> (f64, f64) {
+        let content = std::fs::read_to_string(path).unwrap();
+        let mut lines = content.lines();
+        let start: f64 = lines.next().unwrap().parse().unwrap();
+        let end: f64 = lines.next().unwrap().parse().unwrap();
+        (start, end)
+    };
+
+    let (start_a, end_a) = parse_timestamps(&ts_a);
+    let (start_b, end_b) = parse_timestamps(&ts_b);
+
+    // If tasks ran in parallel, their execution windows must overlap:
+    // overlap exists when max(start_a, start_b) < min(end_a, end_b)
+    let overlap_start = start_a.max(start_b);
+    let overlap_end = end_a.min(end_b);
+    assert!(
+        overlap_start < overlap_end,
+        "Independent tasks should run in parallel (execution windows must overlap).\n\
+         Task A: {start_a:.3}..{end_a:.3}\n\
+         Task B: {start_b:.3}..{end_b:.3}",
     );
 
     Ok(())
@@ -3949,6 +4516,13 @@ mod property_tests {
                     for i in 1..segments.len() {
                         let shorter_prefix = segments[0..i].join(":");
                         let longer_prefix = segments[0..i+1].join(":");
+
+                        // Exact-match-priority: if `shorter_prefix` is itself a task name,
+                        // the matcher returns only that task and does not descend into children.
+                        // The hierarchical-inclusion property does not hold in that case.
+                        if task_names.contains(&shorter_prefix) {
+                            continue;
+                        }
 
                         // Skip if the longer prefix doesn't match any tasks
                         let has_longer_matches = task_names.iter()

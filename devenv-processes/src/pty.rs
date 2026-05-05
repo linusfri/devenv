@@ -53,6 +53,11 @@ impl PtyProcess {
             cmd.env(key, value);
         }
 
+        // Inject OTEL trace context so instrumented subprocesses join the trace.
+        for (key, value) in devenv_activity::trace_propagation_env() {
+            cmd.env(key, value);
+        }
+
         // Spawn the child process
         let child = pair
             .slave
@@ -68,39 +73,42 @@ impl PtyProcess {
         let running = Arc::new(Mutex::new(true));
         let running_clone = Arc::clone(&running);
 
-        let reader_thread = thread::spawn(move || {
-            let mut buffer = [0u8; 8192];
-            loop {
-                // Check if we should stop
-                {
-                    let is_running = running_clone.lock().unwrap();
-                    if !*is_running {
-                        break;
-                    }
-                }
-
-                match reader.read(&mut buffer) {
-                    Ok(0) => {
-                        // EOF reached
-                        debug!("PTY reader: EOF");
-                        break;
-                    }
-                    Ok(n) => {
-                        // Forward to stdout
-                        if let Err(e) = std::io::stdout().write_all(&buffer[..n]) {
-                            error!("PTY reader: Failed to write to stdout: {}", e);
+        let reader_thread = thread::Builder::new()
+            .name("pty-reader".into())
+            .spawn(move || {
+                let mut buffer = [0u8; 8192];
+                loop {
+                    // Check if we should stop
+                    {
+                        let is_running = running_clone.lock().unwrap();
+                        if !*is_running {
                             break;
                         }
-                        let _ = std::io::stdout().flush();
                     }
-                    Err(e) => {
-                        error!("PTY reader: Read error: {}", e);
-                        break;
+
+                    match reader.read(&mut buffer) {
+                        Ok(0) => {
+                            // EOF reached
+                            debug!("PTY reader: EOF");
+                            break;
+                        }
+                        Ok(n) => {
+                            // Forward to stdout
+                            if let Err(e) = std::io::stdout().write_all(&buffer[..n]) {
+                                error!("PTY reader: Failed to write to stdout: {}", e);
+                                break;
+                            }
+                            let _ = std::io::stdout().flush();
+                        }
+                        Err(e) => {
+                            error!("PTY reader: Read error: {}", e);
+                            break;
+                        }
                     }
                 }
-            }
-            debug!("PTY reader thread exiting");
-        });
+                debug!("PTY reader thread exiting");
+            })
+            .expect("failed to spawn pty-reader thread");
 
         Ok(Self {
             child,

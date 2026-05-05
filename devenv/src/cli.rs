@@ -1,10 +1,626 @@
 use crate::tracing as devenv_tracing;
-use clap::{Parser, Subcommand, crate_version};
+use clap::{Parser, Subcommand, ValueEnum, crate_version};
 use clap_complete::engine::{ArgValueCompleter, CompletionCandidate};
-use devenv_core::GlobalOptions;
+use devenv_core::config::NixBackendType;
+use devenv_core::settings::{
+    CacheOptions, InputOverrides, NixOptions, SecretOptions, ShellOptions, flag,
+};
 use devenv_tasks::RunMode;
 use std::ffi::OsStr;
 use std::path::PathBuf;
+use std::str::FromStr;
+use url::Url;
+
+#[derive(clap::ValueEnum, Clone, Copy, Debug, Default, Eq, PartialEq, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum TraceFormat {
+    /// A verbose structured log format used for debugging.
+    Full,
+    /// A JSON log format used for machine consumption.
+    #[default]
+    Json,
+    /// A pretty human-readable log format used for debugging.
+    Pretty,
+    /// OpenTelemetry OTLP export over gRPC.
+    #[value(name = "otlp-grpc")]
+    OtlpGrpc,
+    /// OpenTelemetry OTLP export over HTTP with Protocol Buffers.
+    #[value(name = "otlp-http-protobuf")]
+    OtlpHttpProtobuf,
+    /// OpenTelemetry OTLP export over HTTP with JSON.
+    #[value(name = "otlp-http-json")]
+    OtlpHttpJson,
+}
+
+/// Specifies where trace output should be written.
+///
+/// Accepts the following formats:
+/// - `stdout` - write to standard output
+/// - `stderr` - write to standard error
+/// - `file:/path/to/file` - write to the specified file path
+/// - `http://host:port` or `https://host:port` - send to an OTLP collector (for otlp-* formats)
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum TraceOutput {
+    #[default]
+    Stderr,
+    Stdout,
+    File(PathBuf),
+    Url(Url),
+}
+
+impl std::fmt::Display for TraceOutput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TraceOutput::Stdout => f.write_str("stdout"),
+            TraceOutput::Stderr => f.write_str("stderr"),
+            TraceOutput::File(p) => write!(f, "file:{}", p.display()),
+            TraceOutput::Url(u) => write!(f, "{u}"),
+        }
+    }
+}
+
+impl TraceOutput {
+    /// Returns true if this output targets the terminal (stdout or stderr).
+    pub fn targets_terminal(&self) -> bool {
+        matches!(self, TraceOutput::Stdout | TraceOutput::Stderr)
+    }
+}
+
+impl FromStr for TraceOutput {
+    type Err = ParseTraceOutputError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "stderr" => Ok(TraceOutput::Stderr),
+            "stdout" => Ok(TraceOutput::Stdout),
+            s if s.starts_with("file:") => Ok(TraceOutput::File(PathBuf::from(&s[5..]))),
+            s if s.starts_with("http://") || s.starts_with("https://") => s
+                .parse::<Url>()
+                .map(TraceOutput::Url)
+                .map_err(|e| ParseTraceOutputError::InvalidUrl(e.to_string())),
+            _ => Err(ParseTraceOutputError::UnsupportedFormat(s.to_string())),
+        }
+    }
+}
+
+impl TraceFormat {
+    /// Returns true if this format is an OTLP export format.
+    pub fn is_otlp(&self) -> bool {
+        matches!(
+            self,
+            TraceFormat::OtlpGrpc | TraceFormat::OtlpHttpProtobuf | TraceFormat::OtlpHttpJson
+        )
+    }
+
+    /// Returns the default OTLP endpoint for this format, if applicable.
+    pub fn default_otlp_endpoint(&self) -> Option<&'static str> {
+        match self {
+            TraceFormat::OtlpGrpc => Some("http://localhost:4317"),
+            TraceFormat::OtlpHttpProtobuf | TraceFormat::OtlpHttpJson => {
+                Some("http://localhost:4318")
+            }
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+pub enum ParseTraceOutputError {
+    #[error(
+        "unsupported trace output format '{0}', expected 'stdout', 'stderr', 'file:<path>', or 'http(s)://<host>:<port>'"
+    )]
+    UnsupportedFormat(String),
+    #[error("invalid URL: {0}")]
+    InvalidUrl(String),
+}
+
+/// A trace output specification: format + destination.
+///
+/// Parsed from `[format:]destination` syntax. When format is omitted, defaults to JSON.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TraceOutputSpec {
+    pub format: TraceFormat,
+    pub destination: TraceOutput,
+}
+
+impl FromStr for TraceOutputSpec {
+    type Err = ParseTraceOutputError;
+
+    /// Parse `[format:]destination`.
+    ///
+    /// Format names (`json`, `pretty`, `full`, `otlp-*`) never collide with
+    /// destination prefixes (`file`, `http`, `https`, `stdout`, `stderr`).
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        // Try splitting at first ':' to check for a format prefix.
+        if let Some(colon_pos) = s.find(':') {
+            let prefix = &s[..colon_pos];
+            if let Ok(format) = TraceFormat::from_str(prefix, true) {
+                let rest = &s[colon_pos + 1..];
+                if rest.is_empty() {
+                    // "otlp-grpc:" with no destination — use OTLP default endpoint
+                    if let Some(endpoint) = format.default_otlp_endpoint() {
+                        let url = endpoint
+                            .parse::<Url>()
+                            .map_err(|e| ParseTraceOutputError::InvalidUrl(e.to_string()))?;
+                        return Ok(Self {
+                            format,
+                            destination: TraceOutput::Url(url),
+                        });
+                    }
+                    return Err(ParseTraceOutputError::UnsupportedFormat(format!(
+                        "{s} (format specified but no destination)"
+                    )));
+                }
+                let destination = TraceOutput::from_str(rest)?;
+                return Ok(Self {
+                    format,
+                    destination,
+                });
+            }
+            // prefix wasn't a valid format — treat entire string as a bare destination
+        }
+
+        // No colon or prefix wasn't a format. Try as a bare OTLP format name (e.g. "otlp-grpc").
+        if let Ok(format) = TraceFormat::from_str(s, true) {
+            if let Some(endpoint) = format.default_otlp_endpoint() {
+                let url = endpoint
+                    .parse::<Url>()
+                    .map_err(|e| ParseTraceOutputError::InvalidUrl(e.to_string()))?;
+                return Ok(Self {
+                    format,
+                    destination: TraceOutput::Url(url),
+                });
+            }
+            // Non-OTLP bare format name like "json" alone — not a valid destination
+            return Err(ParseTraceOutputError::UnsupportedFormat(format!(
+                "'{s}' is a format name, not a destination. Use '{s}:<destination>' instead"
+            )));
+        }
+
+        // Bare destination — default to JSON
+        let destination = TraceOutput::from_str(s)?;
+        Ok(Self {
+            format: TraceFormat::Json,
+            destination,
+        })
+    }
+}
+
+impl TraceOutputSpec {
+    /// Validate that the format and destination combination is valid.
+    pub fn validate(&self) -> Result<(), String> {
+        let is_otlp = self.format.is_otlp();
+        match (is_otlp, &self.destination) {
+            (true, TraceOutput::Stdout | TraceOutput::Stderr | TraceOutput::File(_)) => {
+                Err(format!(
+                    "OTLP format '{}' requires an http(s):// endpoint URL",
+                    self.format.to_possible_value().unwrap().get_name()
+                ))
+            }
+            (false, TraceOutput::Url(_)) => Err(format!(
+                "Local format '{}' requires stdout, stderr, or file:<path>",
+                self.format.to_possible_value().unwrap().get_name()
+            )),
+            _ => Ok(()),
+        }
+    }
+}
+
+// --- Domain CLI args (clap-derived, converted to *Options for resolve()) ---
+
+#[derive(clap::Args, Clone, Debug)]
+#[command(next_help_heading = "Nix options")]
+pub struct NixCliArgs {
+    #[arg(
+        short = 'j',
+        long,
+        global = true,
+        env = "DEVENV_MAX_JOBS",
+        help = "Maximum number of Nix builds to run concurrently.",
+        long_help = "Maximum number of Nix builds to run concurrently.\n\nDefaults to 1/4 of available CPU cores (minimum 1)."
+    )]
+    pub max_jobs: Option<u8>,
+
+    #[arg(
+        short = 'u',
+        long,
+        global = true,
+        env = "DEVENV_CORES",
+        help = "Number of CPU cores available to each build.",
+        long_help = "Number of CPU cores available to each build.\n\nDefaults to available cores divided by max-jobs (minimum 1)."
+    )]
+    pub cores: Option<u8>,
+
+    #[arg(
+        short,
+        long,
+        global = true,
+        help = "Override the target system.",
+        long_help = "Override the target system.\n\nDefaults to the host system (e.g. aarch64-darwin, x86_64-linux)."
+    )]
+    pub system: Option<String>,
+
+    #[arg(
+        short,
+        long,
+        global = true,
+        help = "Relax the hermeticity of the environment."
+    )]
+    pub impure: bool,
+
+    #[arg(
+        long,
+        global = true,
+        help = "Force a hermetic environment, overriding config."
+    )]
+    pub no_impure: bool,
+
+    #[arg(
+        long,
+        global = true,
+        help = "Disable substituters and consider all previously downloaded files up-to-date."
+    )]
+    pub offline: bool,
+
+    #[arg(long = "nix-option", global = true, num_args = 2,
+        value_names = ["NAME", "VALUE"],
+        value_delimiter = ' ',
+        help = "Pass additional options to nix commands",
+        long_help = "Pass additional options to nix commands.\n\nThese options are passed directly to Nix using the --option flag.\nSee `man nix.conf` for the full list of available options.\n\nExamples:\n  --nix-option sandbox false\n  --nix-option keep-outputs true\n  --nix-option system x86_64-darwin")]
+    pub nix_options: Vec<String>,
+
+    #[arg(long, global = true, help = "Enter the Nix debugger on failure.")]
+    pub nix_debugger: bool,
+
+    #[arg(
+        long,
+        global = true,
+        value_enum,
+        hide = true,
+        help = "Nix backend to use."
+    )]
+    pub backend: Option<NixBackendType>,
+}
+
+impl From<NixCliArgs> for NixOptions {
+    fn from(cli: NixCliArgs) -> Self {
+        Self {
+            max_jobs: cli.max_jobs,
+            cores: cli.cores,
+            system: cli.system,
+            impure: flag(cli.impure, cli.no_impure),
+            offline: cli.offline.then_some(true),
+            nix_options: cli.nix_options,
+            nix_debugger: cli.nix_debugger.then_some(true),
+            backend: cli.backend,
+        }
+    }
+}
+
+#[derive(clap::Args, Clone, Debug)]
+#[command(next_help_heading = "Cache options")]
+pub struct CacheCliArgs {
+    #[arg(
+        long,
+        global = true,
+        help = "Enable caching of Nix evaluation results (default)."
+    )]
+    pub eval_cache: bool,
+
+    #[arg(
+        long,
+        global = true,
+        help = "Disable caching of Nix evaluation results."
+    )]
+    pub no_eval_cache: bool,
+
+    #[arg(
+        long,
+        global = true,
+        help = "Force a refresh of the Nix evaluation cache."
+    )]
+    pub refresh_eval_cache: bool,
+
+    #[arg(long, global = true, help = "Force a refresh of the task cache.")]
+    pub refresh_task_cache: bool,
+}
+
+impl From<CacheCliArgs> for CacheOptions {
+    fn from(cli: CacheCliArgs) -> Self {
+        Self {
+            eval_cache: flag(cli.eval_cache, cli.no_eval_cache),
+            refresh_eval_cache: cli.refresh_eval_cache.then_some(true),
+            refresh_task_cache: cli.refresh_task_cache.then_some(true),
+        }
+    }
+}
+
+#[derive(clap::Args, Clone, Debug)]
+#[command(next_help_heading = "Shell options")]
+pub struct ShellCliArgs {
+    #[arg(short, long, global = true,
+        num_args = 0..,
+        value_delimiter = ',',
+        help = "Ignore existing environment variables when entering the shell. Pass a list of comma-separated environment variables to let through.")]
+    pub clean: Option<Vec<String>>,
+
+    #[arg(short = 'P', long = "profile", global = true,
+        num_args = 1,
+        action = clap::ArgAction::Append,
+        help = "Activate one or more profiles defined in devenv.nix",
+        long_help = "Activate one or more profiles defined in devenv.nix.\n\nProfiles allow you to define different configurations that can be merged with your base configuration.\n\nSee https://devenv.sh/profiles for more information.\n\nExamples:\n  --profile python-3.14\n  --profile backend --profile fast-startup")]
+    pub profiles: Vec<String>,
+
+    #[arg(
+        long,
+        global = true,
+        help = "Enable auto-reload when config files change (default)."
+    )]
+    pub reload: bool,
+
+    #[arg(
+        long,
+        global = true,
+        help = "Disable auto-reload when config files change."
+    )]
+    pub no_reload: bool,
+
+    #[arg(
+        long = "shell",
+        global = true,
+        env = "DEVENV_SHELL_TYPE",
+        value_parser = clap::builder::PossibleValuesParser::new(["bash", "zsh", "fish", "nu"]),
+        help = "Shell to use for interactive sessions (bash, zsh, fish, nu)."
+    )]
+    pub shell_type: Option<String>,
+}
+
+impl From<ShellCliArgs> for ShellOptions {
+    fn from(cli: ShellCliArgs) -> Self {
+        Self {
+            clean: cli.clean,
+            profiles: cli.profiles,
+            reload: flag(cli.reload, cli.no_reload),
+            shell: cli.shell_type,
+        }
+    }
+}
+
+#[derive(clap::Args, Clone, Debug, Default)]
+#[command(next_help_heading = "Secretspec options")]
+pub struct SecretCliArgs {
+    #[arg(
+        long,
+        global = true,
+        env = "SECRETSPEC_PROVIDER",
+        help = "Override the secretspec provider"
+    )]
+    pub secretspec_provider: Option<String>,
+
+    #[arg(
+        long,
+        global = true,
+        env = "SECRETSPEC_PROFILE",
+        help = "Override the secretspec profile"
+    )]
+    pub secretspec_profile: Option<String>,
+}
+
+impl From<SecretCliArgs> for SecretOptions {
+    fn from(cli: SecretCliArgs) -> Self {
+        Self {
+            secretspec_provider: cli.secretspec_provider,
+            secretspec_profile: cli.secretspec_profile,
+        }
+    }
+}
+
+#[derive(clap::Args, Clone, Debug, Default)]
+#[command(next_help_heading = "Input overrides")]
+pub struct InputOverrideCliArgs {
+    #[arg(short, long = "override-input", global = true,
+        num_args = 2,
+        value_names = ["NAME", "URI"],
+        value_delimiter = ' ',
+        help = "Override inputs in devenv.yaml",
+        long_help = "Override inputs in devenv.yaml.\n\nExamples:\n  --override-input nixpkgs github:NixOS/nixpkgs/nixos-unstable\n  --override-input nixpkgs path:/path/to/local/nixpkgs")]
+    pub override_inputs: Vec<String>,
+
+    #[arg(long = "option", short = 'O', global = true,
+        num_args = 2,
+        value_names = ["OPTION:TYPE", "VALUE"],
+        help = "Override configuration options with typed values",
+        long_help = "Override configuration options with typed values.\n\nOPTION must include a type: <attribute>:<type>\nSupported types: string, int, float, bool, path, pkg, pkgs\n\nList types (pkgs) append to existing values by default.\nAdd a ! suffix to replace instead: pkgs!\n\nExamples:\n  --option languages.rust.channel:string beta\n  --option services.postgres.enable:bool true\n  --option languages.python.version:string 3.10\n  --option packages:pkgs \"ncdu git\"       (appends to packages)\n  --option packages:pkgs! \"ncdu git\"      (replaces all packages)")]
+    pub nix_module_options: Vec<String>,
+}
+
+impl From<InputOverrideCliArgs> for InputOverrides {
+    fn from(cli: InputOverrideCliArgs) -> Self {
+        Self {
+            override_inputs: cli.override_inputs,
+            nix_module_options: cli.nix_module_options,
+        }
+    }
+}
+
+// --- CLI-only options ---
+
+#[derive(clap::Args, Clone, Debug)]
+#[command(next_help_heading = "Tracing options")]
+pub struct TracingCliArgs {
+    #[arg(
+        long = "trace-to",
+        global = true,
+        action = clap::ArgAction::Append,
+        help = "Enable tracing. Repeatable. Syntax: [format:]destination. [env: DEVENV_TRACE_TO=]",
+        long_help = "Enable tracing and set output destination(s). Can be repeated for multiple outputs.\n\n\
+            Syntax: [format:]destination\n\n\
+            Examples:\n  \
+            --trace-to stderr                              # json to stderr\n  \
+            --trace-to pretty:stderr                       # pretty format to stderr\n  \
+            --trace-to json:file:/tmp/trace.json           # JSON to file\n  \
+            --trace-to otlp-grpc                           # OTLP gRPC to default endpoint\n  \
+            --trace-to otlp-grpc:http://collector:4317     # OTLP gRPC to custom endpoint\n\n\
+            Multiple outputs:\n  \
+            --trace-to pretty:stderr --trace-to json:file:/tmp/t.json\n\n\
+            Destinations: stdout, stderr, file:<path>, http(s)://<host>:<port>\n\
+            Formats: json (default), pretty, full, otlp-grpc, otlp-http-protobuf, otlp-http-json\n\n\
+            When format is omitted, defaults to json.\n\
+            Tracing is disabled by default.\n\n\
+            [env: DEVENV_TRACE_TO=] (comma-separated)"
+    )]
+    pub trace_to: Vec<TraceOutputSpec>,
+
+    // Legacy flags — hidden, kept for backward compatibility.
+    #[arg(
+        long,
+        global = true,
+        env = "DEVENV_TRACE_OUTPUT",
+        hide = true,
+        help = "Legacy: use --trace-to instead."
+    )]
+    pub trace_output: Option<TraceOutput>,
+
+    #[arg(
+        long,
+        global = true,
+        env = "DEVENV_TRACE_FORMAT",
+        hide = true,
+        help = "Legacy: use --trace-to instead.",
+        default_value_t,
+        value_enum
+    )]
+    pub trace_format: TraceFormat,
+}
+
+#[derive(clap::Args, Clone, Debug)]
+#[command(next_help_heading = "Global options")]
+pub struct CliOptions {
+    #[arg(short, long, global = true, help = "Enable additional debug logs.")]
+    pub verbose: bool,
+
+    #[arg(
+        short,
+        long,
+        global = true,
+        conflicts_with = "verbose",
+        help = "Silence all logs"
+    )]
+    pub quiet: bool,
+
+    #[arg(
+        long,
+        global = true,
+        env = "DEVENV_TUI",
+        value_parser = clap::builder::BoolishValueParser::new(),
+        help = "Enable the interactive terminal interface (default when interactive)."
+    )]
+    pub tui: Option<bool>,
+
+    #[arg(
+        long,
+        global = true,
+        help = "Disable the interactive terminal interface."
+    )]
+    pub no_tui: bool,
+
+    #[arg(short, long, action = clap::ArgAction::Help, global = true, help = "Print help (see a summary with '-h')")]
+    pub help: Option<bool>,
+
+    #[arg(
+        short = 'V',
+        long,
+        global = true,
+        help = "Print version information",
+        long_help = "Print version information and exit"
+    )]
+    pub version: bool,
+}
+
+impl TracingCliArgs {
+    /// Parse `DEVENV_TRACE_TO` env var (comma-separated `[format:]destination` specs).
+    fn specs_from_env() -> Result<Vec<TraceOutputSpec>, String> {
+        let val = match std::env::var("DEVENV_TRACE_TO") {
+            Ok(v) if !v.is_empty() => v,
+            _ => return Ok(Vec::new()),
+        };
+        val.split(',')
+            .map(|s| {
+                s.trim()
+                    .parse::<TraceOutputSpec>()
+                    .map_err(|e| format!("DEVENV_TRACE_TO: {e}"))
+            })
+            .collect()
+    }
+
+    /// Validate and merge all trace sources: `DEVENV_TRACE_TO` env var,
+    /// `--trace-to` CLI flags, and legacy `--trace-output`/`--trace-format`.
+    pub fn resolve_and_validate(&self) -> Result<Vec<TraceOutputSpec>, String> {
+        // Legacy --trace-output doesn't support URLs
+        if let Some(TraceOutput::Url(_)) = self.trace_output {
+            return Err(
+                "--trace-output does not support URLs. Use --trace-to instead.".to_string(),
+            );
+        }
+        // Legacy --trace-format doesn't support OTLP
+        if self.trace_output.is_some() && self.trace_format.is_otlp() {
+            return Err(
+                "--trace-format does not support OTLP formats. Use --trace-to instead.".to_string(),
+            );
+        }
+
+        let mut specs = Self::specs_from_env()?;
+
+        // CLI --trace-to flags append after env var specs
+        specs.extend(self.trace_to.iter().cloned());
+
+        if let Some(ref output) = self.trace_output {
+            specs.push(TraceOutputSpec {
+                format: self.trace_format,
+                destination: output.clone(),
+            });
+        }
+
+        for spec in &specs {
+            spec.validate()?;
+        }
+
+        // Reject duplicate destinations (e.g. json:stderr + pretty:stderr)
+        for (i, a) in specs.iter().enumerate() {
+            for b in &specs[i + 1..] {
+                if a.destination == b.destination {
+                    return Err(format!(
+                        "duplicate trace destination '{}' (would interleave output)",
+                        a.destination
+                    ));
+                }
+            }
+        }
+
+        Ok(specs)
+    }
+
+    /// Returns true if tracing-only mode should be used (disables TUI).
+    ///
+    /// Prefer deriving this from the resolved specs returned by
+    /// `resolve_and_validate()` to avoid double-parsing `DEVENV_TRACE_TO`.
+    /// This method remains for cases where validation hasn't run yet.
+    pub fn use_tracing_mode(&self) -> bool {
+        let env_targets_terminal = Self::specs_from_env()
+            .ok()
+            .is_some_and(|specs| specs.iter().any(|s| s.destination.targets_terminal()));
+
+        env_targets_terminal
+            || self
+                .trace_to
+                .iter()
+                .any(|s| s.destination.targets_terminal())
+            || self
+                .trace_output
+                .as_ref()
+                .is_some_and(|d| d.targets_terminal())
+    }
+}
 
 /// Complete task names by reading from .devenv/task-names.txt cache file.
 /// Walks up from current directory to find the project root.
@@ -49,6 +665,8 @@ fn complete_task_names(current: &OsStr) -> Vec<CompletionCandidate> {
 #[command(
     name = "devenv",
     color = clap::ColorChoice::Auto,
+    disable_help_flag = true,
+    arg_required_else_help = true,
     // for --clean to work with subcommands
     subcommand_precedence_over_arg = true,
     dont_delimit_trailing_values = true,
@@ -56,25 +674,45 @@ fn complete_task_names(current: &OsStr) -> Vec<CompletionCandidate> {
 )]
 pub struct Cli {
     #[command(subcommand)]
-    pub command: Option<Commands>,
+    pub command: Commands,
+
+    #[arg(
+        long,
+        global = true,
+        help_heading = "Input overrides",
+        help = "Source for devenv.nix (flake input reference or path)",
+        long_help = "Source for devenv.nix.\n\nCan be either a filesystem path (with path: prefix) or a flake input reference.\n\nExamples:\n  --from github:cachix/devenv\n  --from github:cachix/devenv?dir=examples/simple\n  --from path:/absolute/path/to/project\n  --from path:./relative/path"
+    )]
+    pub from: Option<String>,
 
     #[command(flatten)]
-    pub global_options: GlobalOptions,
+    pub input_overrides: InputOverrideCliArgs,
+
+    #[command(flatten)]
+    pub nix_args: NixCliArgs,
+
+    #[command(flatten)]
+    pub shell_args: ShellCliArgs,
+
+    #[command(flatten)]
+    pub cache_args: CacheCliArgs,
+
+    #[command(flatten)]
+    pub secret_args: SecretCliArgs,
+
+    #[command(flatten)]
+    pub tracing_args: TracingCliArgs,
+
+    #[command(flatten)]
+    pub cli_options: CliOptions,
 }
 
 impl Cli {
-    /// Parse the CLI arguments with clap and resolve any conflicting options.
-    pub fn parse_and_resolve_options() -> Self {
-        let mut cli = Self::parse();
-        cli.global_options.resolve_overrides();
-        cli
-    }
-
     pub fn get_log_level(&self) -> devenv_tracing::Level {
-        if self.global_options.verbose {
+        if self.cli_options.verbose {
             devenv_tracing::Level::Debug
-        } else if self.global_options.quiet {
-            devenv_tracing::Level::Silent
+        } else if self.cli_options.quiet {
+            devenv_tracing::Level::Warn
         } else {
             devenv_tracing::Level::default()
         }
@@ -94,9 +732,6 @@ pub enum Commands {
         cmd: Option<String>,
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
-
-        #[arg(long, help = "Disable auto-reload when config files change")]
-        no_reload: bool,
     },
 
     #[command(about = "Update devenv.lock from devenv.yaml inputs. http://devenv.sh/inputs/")]
@@ -115,17 +750,8 @@ pub enum Commands {
 
     #[command(about = "Start processes in the foreground. https://devenv.sh/processes/")]
     Up {
-        #[arg(help = "Start a specific process(es).")]
-        processes: Vec<String>,
-
-        #[arg(short, long, help = "Start processes in the background.")]
-        detach: bool,
-
-        #[arg(
-            long,
-            help = "Error if a port is already in use instead of auto-allocating the next available port."
-        )]
-        strict_ports: bool,
+        #[command(flatten)]
+        up_args: UpArgs,
     },
 
     Processes {
@@ -141,7 +767,16 @@ pub enum Commands {
 
     #[command(about = "Run tests. http://devenv.sh/tests/", alias = "ci")]
     Test {
-        #[arg(short, long, help = "Don't override .devenv to a temporary directory.")]
+        #[arg(
+            long,
+            help = "Override .devenv with a temporary directory for isolation."
+        )]
+        override_dotfile: bool,
+        #[arg(
+            long,
+            help = "Deprecated: no-op flag kept for backward compatibility.",
+            hide = true
+        )]
         dont_override_dotfile: bool,
     },
 
@@ -220,26 +855,82 @@ pub enum Commands {
         #[arg(long, help = "Print nixd configuration and exit")]
         print_config: bool,
     },
+
+    #[command(
+        about = "Print shell hook for auto-activation on directory change.",
+        long_about = "Print shell hook for auto-activation on directory change.\n\nAdd to your shell config:\n\n  bash:    eval \"$(devenv hook bash)\"     # in ~/.bashrc\n  zsh:     eval \"$(devenv hook zsh)\"      # in ~/.zshrc\n  fish:    devenv hook fish | source       # in ~/.config/fish/config.fish\n  nushell: see devenv hook nu              # in config.nu"
+    )]
+    Hook {
+        #[arg(value_enum)]
+        shell: HookShell,
+    },
+
+    #[command(about = "Allow auto-activation for the current directory.")]
+    Allow,
+
+    #[command(about = "Revoke auto-activation for the current directory.")]
+    Revoke,
+
+    /// Internal: check if hook should activate devenv in current directory
+    #[clap(hide = true)]
+    HookShouldActivate,
+
+    /// Internal: run native process manager as a daemon (used by `devenv up -d`)
+    #[clap(hide = true)]
+    DaemonProcesses {
+        /// Path to the serialized task config JSON file
+        config_file: PathBuf,
+    },
+}
+
+#[derive(clap::ValueEnum, Clone, Copy, Debug)]
+pub enum HookShell {
+    Bash,
+    Zsh,
+    Fish,
+    Nu,
+}
+
+#[derive(clap::Args, Clone, Debug)]
+pub struct UpArgs {
+    #[arg(help = "Start a specific process(es).")]
+    pub processes: Vec<String>,
+
+    #[arg(short, long, help = "Start processes in the background.")]
+    pub detach: bool,
+
+    #[arg(
+        short,
+        long,
+        help = "The execution mode for process tasks (affects dependency resolution)",
+        value_enum,
+        default_value_t = RunMode::Before
+    )]
+    pub mode: RunMode,
+
+    #[arg(
+        long,
+        help = "Error if a port is already in use instead of auto-allocating the next available port."
+    )]
+    pub strict_ports: bool,
+
+    #[arg(
+        long,
+        help = "Disable strict port mode, overriding strictPorts from devenv.yaml."
+    )]
+    pub no_strict_ports: bool,
 }
 
 #[derive(Subcommand, Clone)]
 #[clap(about = "Start or stop processes. https://devenv.sh/processes/")]
 pub enum ProcessesCommand {
-    #[command(alias = "start", about = "Start processes in the foreground.")]
+    #[command(about = "Start processes in the foreground.")]
     Up {
-        processes: Vec<String>,
-
-        #[arg(short, long, help = "Start processes in the background.")]
-        detach: bool,
-
-        #[arg(
-            long,
-            help = "Error if a port is already in use instead of auto-allocating the next available port."
-        )]
-        strict_ports: bool,
+        #[command(flatten)]
+        up_args: UpArgs,
     },
 
-    #[command(alias = "stop", about = "Stop processes running in the background.")]
+    #[command(about = "Stop processes running in the background.")]
     Down {},
 
     #[command(about = "Wait for all processes to be ready.")]
@@ -247,7 +938,56 @@ pub enum ProcessesCommand {
         #[arg(long, default_value = "120", help = "Timeout in seconds.")]
         timeout: u64,
     },
-    // TODO: Status/Attach
+
+    #[command(about = "List all managed processes and their status.")]
+    List {},
+
+    #[command(about = "Get the status of a process.")]
+    Status {
+        #[arg(help = "Name of the process.")]
+        name: String,
+    },
+
+    #[command(about = "Get logs for a process.")]
+    Logs {
+        #[arg(help = "Name of the process.")]
+        name: String,
+
+        #[arg(
+            short = 'n',
+            long,
+            default_value = "100",
+            help = "Number of lines to show."
+        )]
+        lines: usize,
+
+        #[arg(long, conflicts_with = "stderr", help = "Show only stdout.")]
+        stdout: bool,
+
+        #[arg(long, conflicts_with = "stdout", help = "Show only stderr.")]
+        stderr: bool,
+    },
+
+    #[command(about = "Restart a process.")]
+    Restart {
+        #[arg(help = "Name of the process.")]
+        name: String,
+    },
+
+    #[command(about = "Start a process (or all processes if no name given).")]
+    Start {
+        #[arg(help = "Name of the process. If omitted, starts all processes (same as 'up').")]
+        name: Option<String>,
+
+        #[arg(short, long, help = "Start processes in the background.")]
+        detach: bool,
+    },
+
+    #[command(about = "Stop a running process (or all processes if no name given).")]
+    Stop {
+        #[arg(help = "Name of the process. If omitted, stops all processes (same as 'down').")]
+        name: Option<String>,
+    },
 }
 
 #[derive(Subcommand, Clone)]
@@ -263,7 +1003,7 @@ pub enum TasksCommand {
             long,
             help = "The execution mode for tasks (affects dependency resolution)",
             value_enum,
-            default_value_t = RunMode::Single
+            default_value_t = RunMode::Before
         )]
         mode: RunMode,
 
@@ -340,11 +1080,251 @@ pub enum InputsCommand {
 
 #[cfg(test)]
 mod tests {
-    use super::Cli;
+    use super::*;
+    use clap::Parser;
 
     #[test]
     fn verify_cli() {
         use clap::CommandFactory;
         Cli::command().debug_assert()
+    }
+
+    #[test]
+    fn trace_output_spec_bare_destination_defaults_to_json() {
+        let spec: TraceOutputSpec = "stderr".parse().unwrap();
+        assert_eq!(spec.format, TraceFormat::Json);
+        assert_eq!(spec.destination, TraceOutput::Stderr);
+    }
+
+    #[test]
+    fn trace_output_spec_format_prefix() {
+        let spec: TraceOutputSpec = "pretty:stderr".parse().unwrap();
+        assert_eq!(spec.format, TraceFormat::Pretty);
+        assert_eq!(spec.destination, TraceOutput::Stderr);
+    }
+
+    #[test]
+    fn trace_output_spec_json_file() {
+        let spec: TraceOutputSpec = "json:file:/tmp/trace.json".parse().unwrap();
+        assert_eq!(spec.format, TraceFormat::Json);
+        assert_eq!(
+            spec.destination,
+            TraceOutput::File(PathBuf::from("/tmp/trace.json"))
+        );
+    }
+
+    #[test]
+    fn trace_output_spec_bare_file_destination() {
+        let spec: TraceOutputSpec = "file:/tmp/trace.json".parse().unwrap();
+        assert_eq!(spec.format, TraceFormat::Json);
+        assert_eq!(
+            spec.destination,
+            TraceOutput::File(PathBuf::from("/tmp/trace.json"))
+        );
+    }
+
+    #[test]
+    fn trace_output_spec_bare_otlp() {
+        let spec: TraceOutputSpec = "otlp-grpc".parse().unwrap();
+        assert_eq!(spec.format, TraceFormat::OtlpGrpc);
+        assert_eq!(
+            spec.destination,
+            TraceOutput::Url("http://localhost:4317".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn trace_output_spec_otlp_with_url() {
+        let spec: TraceOutputSpec = "otlp-grpc:http://collector:4317".parse().unwrap();
+        assert_eq!(spec.format, TraceFormat::OtlpGrpc);
+        assert_eq!(
+            spec.destination,
+            TraceOutput::Url("http://collector:4317".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn trace_output_spec_bare_format_name_errors() {
+        let result: Result<TraceOutputSpec, _> = "json".parse();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn trace_to_bare_defaults_to_json() {
+        let args = TracingCliArgs {
+            trace_to: vec!["stderr".parse().unwrap()],
+            trace_output: None,
+            trace_format: TraceFormat::Pretty, // should NOT affect --trace-to
+        };
+        let specs = args.resolve_and_validate().unwrap();
+        assert_eq!(specs[0].format, TraceFormat::Json);
+    }
+
+    #[test]
+    fn trace_to_preserves_explicit_format() {
+        let args = TracingCliArgs {
+            trace_to: vec!["pretty:stderr".parse().unwrap()],
+            trace_output: None,
+            trace_format: TraceFormat::Json,
+        };
+        let specs = args.resolve_and_validate().unwrap();
+        assert_eq!(specs[0].format, TraceFormat::Pretty);
+    }
+
+    #[test]
+    fn legacy_trace_output_uses_trace_format() {
+        let args = TracingCliArgs {
+            trace_to: vec![],
+            trace_output: Some(TraceOutput::Stderr),
+            trace_format: TraceFormat::Pretty,
+        };
+        let specs = args.resolve_and_validate().unwrap();
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].format, TraceFormat::Pretty);
+        assert_eq!(specs[0].destination, TraceOutput::Stderr);
+    }
+
+    #[test]
+    fn legacy_and_new_merge_different_destinations() {
+        let args = TracingCliArgs {
+            trace_to: vec!["json:file:/tmp/t.json".parse().unwrap()],
+            trace_output: Some(TraceOutput::Stderr),
+            trace_format: TraceFormat::Pretty,
+        };
+        let specs = args.resolve_and_validate().unwrap();
+        assert_eq!(specs.len(), 2);
+        assert_eq!(specs[0].format, TraceFormat::Json);
+        assert_eq!(specs[1].format, TraceFormat::Pretty);
+    }
+
+    #[test]
+    fn trace_output_spec_validate_otlp_with_file_fails() {
+        let spec = TraceOutputSpec {
+            format: TraceFormat::OtlpGrpc,
+            destination: TraceOutput::File(PathBuf::from("/tmp/x")),
+        };
+        assert!(spec.validate().is_err());
+    }
+
+    #[test]
+    fn trace_output_spec_validate_json_with_url_fails() {
+        let spec = TraceOutputSpec {
+            format: TraceFormat::Json,
+            destination: TraceOutput::Url("http://localhost:4317".parse().unwrap()),
+        };
+        assert!(spec.validate().is_err());
+    }
+
+    #[test]
+    fn duplicate_destination_rejected() {
+        let args = TracingCliArgs {
+            trace_to: vec![
+                "json:stderr".parse().unwrap(),
+                "pretty:stderr".parse().unwrap(),
+            ],
+            trace_output: None,
+            trace_format: TraceFormat::Json,
+        };
+        let err = args.resolve_and_validate().unwrap_err();
+        assert!(err.contains("duplicate"), "{err}");
+    }
+
+    #[test]
+    fn duplicate_destination_legacy_and_new() {
+        let args = TracingCliArgs {
+            trace_to: vec!["json:stderr".parse().unwrap()],
+            trace_output: Some(TraceOutput::Stderr),
+            trace_format: TraceFormat::Pretty,
+        };
+        let err = args.resolve_and_validate().unwrap_err();
+        assert!(err.contains("duplicate"), "{err}");
+    }
+
+    #[test]
+    fn trace_to_multiple_from_cli() {
+        let cli = Cli::parse_from([
+            "devenv",
+            "--trace-to",
+            "json:file:/tmp/trace.json",
+            "--trace-to",
+            "pretty:stderr",
+            "shell",
+        ]);
+        let specs = cli.tracing_args.resolve_and_validate().unwrap();
+        assert_eq!(specs.len(), 2);
+        assert_eq!(specs[0].format, TraceFormat::Json);
+        assert_eq!(specs[1].format, TraceFormat::Pretty);
+        assert_eq!(specs[1].destination, TraceOutput::Stderr);
+    }
+
+    #[test]
+    fn legacy_trace_output_from_cli() {
+        let cli = Cli::parse_from([
+            "devenv",
+            "--trace-output",
+            "stderr",
+            "--trace-format",
+            "pretty",
+            "shell",
+        ]);
+        let specs = cli.tracing_args.resolve_and_validate().unwrap();
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].format, TraceFormat::Pretty);
+        assert_eq!(specs[0].destination, TraceOutput::Stderr);
+    }
+
+    #[test]
+    fn parse_comma_separated_trace_specs() {
+        let specs: Vec<TraceOutputSpec> = "pretty:stderr,json:file:/tmp/t.json"
+            .split(',')
+            .map(|s| s.trim().parse().unwrap())
+            .collect();
+        assert_eq!(specs.len(), 2);
+        assert_eq!(specs[0].format, TraceFormat::Pretty);
+        assert_eq!(specs[0].destination, TraceOutput::Stderr);
+        assert_eq!(specs[1].format, TraceFormat::Json);
+        assert_eq!(
+            specs[1].destination,
+            TraceOutput::File(PathBuf::from("/tmp/t.json"))
+        );
+    }
+
+    #[test]
+    fn parse_comma_separated_with_otlp() {
+        let specs: Vec<TraceOutputSpec> = "otlp-grpc,pretty:stderr"
+            .split(',')
+            .map(|s| s.trim().parse().unwrap())
+            .collect();
+        assert_eq!(specs.len(), 2);
+        assert_eq!(specs[0].format, TraceFormat::OtlpGrpc);
+        assert_eq!(specs[1].format, TraceFormat::Pretty);
+    }
+
+    #[test]
+    fn up_accepts_no_strict_ports() {
+        let cli = Cli::parse_from(["devenv", "up", "--no-strict-ports"]);
+
+        match cli.command {
+            Commands::Up { up_args } => {
+                assert!(!up_args.strict_ports);
+                assert!(up_args.no_strict_ports);
+            }
+            _ => panic!("expected `devenv up` command"),
+        }
+    }
+
+    #[test]
+    fn processes_up_accepts_no_strict_ports() {
+        let cli = Cli::parse_from(["devenv", "processes", "up", "--no-strict-ports"]);
+
+        match cli.command {
+            Commands::Processes {
+                command: ProcessesCommand::Up { up_args },
+            } => {
+                assert!(!up_args.strict_ports);
+                assert!(up_args.no_strict_ports);
+            }
+            _ => panic!("expected `devenv processes up` command"),
+        }
     }
 }

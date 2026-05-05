@@ -23,6 +23,18 @@ that developers can override some things for their local use case.
 Configuration for [inputs](inputs.md) and [imports](composing-using-imports.md),
 allowing you to specify dependencies and how to compose them.
 
+You can require a specific devenv version to make sure all developers use a compatible version:
+
+```yaml title="devenv.yaml"
+# Enforce CLI matches the modules version
+require_version: true
+
+# Or use an explicit constraint
+require_version: ">=2.1"
+```
+
+See [devenv.yaml reference](reference/yaml-options.md#require_version) for details.
+
 ### devenv.lock
 
 Pinned [inputs](inputs.md), making sure your developer environment is reproducible.
@@ -59,3 +71,7 @@ Defaults to `$XDG_RUNTIME_DIR` and falls back to `$TMPDIR` and finally `/tmp`.
 Points to the Nix store path that has final profile of packages/scripts provided by devenv.
 
 Useful for teaching other programs about `/bin`, `/etc`, `/var` folders.
+
+### $DEVENV_HOME
+
+Points to `~/.local/share/devenv` (following the XDG data directory convention). Stores GC roots and other persistent per user data.

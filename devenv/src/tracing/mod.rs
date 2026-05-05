@@ -1,12 +1,14 @@
 mod devenv_layer;
 mod human_duration;
+#[cfg(feature = "otlp")]
+mod otel;
 mod span_ids;
 mod span_timings;
 
 use devenv_layer::{DevenvFormat, DevenvLayer};
 use span_ids::{SpanContext, SpanIdLayer};
 
-pub use devenv_core::cli::{TraceFormat, TraceOutput};
+pub use crate::cli::{TraceFormat, TraceOutput, TraceOutputSpec};
 pub use human_duration::HumanReadableDuration;
 
 use json_subscriber::JsonLayer;
@@ -14,7 +16,8 @@ use std::fs::File;
 use std::io::{self, IsTerminal, LineWriter, Write};
 use std::sync::Mutex;
 use tracing::level_filters::LevelFilter;
-use tracing_subscriber::{EnvFilter, Registry, prelude::*};
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::{EnvFilter, Layer, Registry, util::SubscriberInitExt};
 
 #[derive(Default, Clone, Copy, Eq, PartialEq, Ord, PartialOrd)]
 pub enum Level {
@@ -70,9 +73,17 @@ fn create_trace_writer(output: &TraceOutput) -> Option<Mutex<TraceWriter>> {
         TraceOutput::Stderr => Some(Mutex::new(TraceWriter::Stderr(LineWriter::new(
             io::stderr(),
         )))),
-        TraceOutput::File(path) => File::create(path)
-            .ok()
-            .map(|f| Mutex::new(TraceWriter::File(LineWriter::new(f)))),
+        TraceOutput::File(path) => match File::create(path) {
+            Ok(f) => Some(Mutex::new(TraceWriter::File(LineWriter::new(f)))),
+            Err(e) => {
+                eprintln!(
+                    "warning: failed to create trace output file '{}': {e}",
+                    path.display()
+                );
+                None
+            }
+        },
+        TraceOutput::Url(_) => None,
     }
 }
 
@@ -92,75 +103,171 @@ where
 }
 
 fn create_filter(level: Level) -> EnvFilter {
-    EnvFilter::builder()
+    let filter = EnvFilter::builder()
         .with_default_directive(LevelFilter::from(level).into())
         .from_env_lossy()
-        .add_directive("devenv::activity=trace".parse().unwrap())
+        .add_directive("watchexec=warn".parse().unwrap());
+
+    if level <= Level::Warn {
+        // In quiet mode the TUI is off and activity span events would just
+        // leak to stderr, so suppress them entirely.
+        filter.add_directive("devenv_activity=warn".parse().unwrap())
+    } else {
+        // Activity spans at trace level are needed so the TUI can render
+        // all activity events.
+        filter.add_directive("devenv_activity=trace".parse().unwrap())
+    }
 }
 
-pub fn init_tracing_default() {
-    init_cli_tracing(Level::default(), None);
-}
-
-/// Initialize tracing for legacy CLI mode.
-/// Export format is always JSON.
-pub fn init_cli_tracing(level: Level, trace_output: Option<&TraceOutput>) {
-    let ansi = io::stderr().is_terminal();
-    let export_writer = trace_output.and_then(create_trace_writer);
-
-    Registry::default()
-        .with(create_filter(level))
-        .with(SpanIdLayer)
-        .with(DevenvLayer::new())
-        .with(
-            tracing_subscriber::fmt::layer()
-                .event_format(DevenvFormat::default())
-                .with_writer(io::stderr)
-                .with_ansi(ansi),
-        )
-        .with(export_writer.map(create_json_layer))
-        .init();
-}
-
-/// Initialize tracing with the specified format and output destination.
+/// Opaque guard that flushes tracing resources on drop.
 ///
-/// If `trace_output` is None, no traces are output.
-/// If `trace_output` is Some, traces go to that destination (stdout, stderr, or file).
-pub fn init_tracing(level: Level, trace_format: TraceFormat, trace_output: Option<&TraceOutput>) {
-    let base = Registry::default()
+/// Hold this in `main` until the program exits.
+pub struct TracingGuard {
+    _inner: Vec<Box<dyn Send>>,
+}
+
+impl TracingGuard {
+    fn empty() -> Self {
+        Self { _inner: vec![] }
+    }
+}
+
+pub fn init_tracing_default() -> TracingGuard {
+    init_tracing(Level::default(), &[], true)
+}
+
+/// Initialize tracing with multiple output specs.
+///
+/// When `cli_output` is true, a stderr layer renders plain `tracing` events
+/// (`info!`/`warn!`/`error!`). Activity start/complete output is produced
+/// separately by the activity channel consumers ([`crate::console::ConsoleOutput`]
+/// or the TUI), not by this layer stack — set `cli_output` to false when those
+/// consumers own the terminal.
+///
+/// Each `TraceOutputSpec` adds an export layer with its own format and destination.
+/// Multiple outputs can be active simultaneously (e.g. pretty to stderr + JSON to file).
+///
+/// Returns a [`TracingGuard`] that must be held until program exit to ensure
+/// proper flushing of trace data.
+pub fn init_tracing(level: Level, specs: &[TraceOutputSpec], cli_output: bool) -> TracingGuard {
+    let has_otlp = specs.iter().any(|s| s.format.is_otlp());
+
+    if has_otlp {
+        return init_tracing_with_otlp(level, specs, cli_output);
+    }
+
+    init_tracing_local(level, specs, cli_output)
+}
+
+/// Renders plain `tracing` events (info!/warn!/error!) to stderr.
+/// Activity start/complete output is produced by the activity channel
+/// consumers, not here.
+pub(crate) fn build_cli_layer<S>(
+    level: Level,
+    cli_output: bool,
+) -> Option<Box<dyn Layer<S> + Send + Sync>>
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+{
+    if !cli_output {
+        return None;
+    }
+    let ansi = io::stderr().is_terminal();
+    let verbose = level >= Level::Debug;
+    Some(Box::new(
+        tracing_subscriber::fmt::layer()
+            .event_format(DevenvFormat { verbose })
+            .with_writer(io::stderr)
+            .with_ansi(ansi),
+    ))
+}
+
+/// Create a boxed local-format layer for a single spec.
+pub(crate) fn create_local_boxed_layer<S>(
+    spec: &TraceOutputSpec,
+) -> Option<Box<dyn Layer<S> + Send + Sync>>
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+{
+    let writer = create_trace_writer(&spec.destination)?;
+    let ansi = match &spec.destination {
+        TraceOutput::Stdout => io::stdout().is_terminal(),
+        TraceOutput::Stderr => io::stderr().is_terminal(),
+        _ => false,
+    };
+    match spec.format {
+        TraceFormat::Full => Some(Box::new(
+            tracing_subscriber::fmt::layer()
+                .with_ansi(ansi)
+                .with_writer(writer),
+        )),
+        TraceFormat::Pretty => Some(Box::new(
+            tracing_subscriber::fmt::layer()
+                .with_ansi(ansi)
+                .with_writer(writer)
+                .pretty(),
+        )),
+        TraceFormat::Json => Some(Box::new(create_json_layer(writer))),
+        _ => None, // OTLP handled elsewhere
+    }
+}
+
+/// Init tracing with only local-format specs (no OTLP).
+fn init_tracing_local(level: Level, specs: &[TraceOutputSpec], cli_output: bool) -> TracingGuard {
+    let mut layers: Vec<Box<dyn Layer<_> + Send + Sync>> = Vec::new();
+
+    if let Some(cli_layer) = build_cli_layer(level, cli_output) {
+        layers.push(cli_layer);
+    }
+
+    for spec in specs {
+        if let Some(layer) = create_local_boxed_layer(spec) {
+            layers.push(layer);
+        }
+    }
+
+    // DevenvLayer must be outermost: its on_new_span/on_close emit synthetic
+    // events via ctx.event(), which only dispatch to layers *below* it. Placing
+    // it last ensures all export layers receive those events.
+    let _ = Registry::default()
         .with(create_filter(level))
         .with(SpanIdLayer)
-        .with(DevenvLayer::new());
+        .with(layers)
+        .with(DevenvLayer::new())
+        .try_init();
 
-    let ansi = match trace_output {
-        Some(TraceOutput::Stdout) => io::stdout().is_terminal(),
-        Some(TraceOutput::Stderr) => io::stderr().is_terminal(),
-        Some(TraceOutput::File(_)) | None => false,
-    };
+    TracingGuard::empty()
+}
 
-    let writer = trace_output.and_then(create_trace_writer);
+fn init_tracing_with_otlp(
+    level: Level,
+    specs: &[TraceOutputSpec],
+    cli_output: bool,
+) -> TracingGuard {
+    #[cfg(feature = "otlp")]
+    {
+        otel::init_tracing_unified(level, specs, cli_output)
+    }
 
-    match trace_format {
-        TraceFormat::Full => {
-            let layer = writer.map(|w| {
-                tracing_subscriber::fmt::layer()
-                    .with_ansi(ansi)
-                    .with_writer(w)
-            });
-            base.with(layer).init()
-        }
-        TraceFormat::Pretty => {
-            let layer = writer.map(|w| {
-                tracing_subscriber::fmt::layer()
-                    .with_ansi(ansi)
-                    .with_writer(w)
-                    .pretty()
-            });
-            base.with(layer).init()
-        }
-        TraceFormat::Json => {
-            let layer = writer.map(create_json_layer);
-            base.with(layer).init()
-        }
+    #[cfg(not(feature = "otlp"))]
+    {
+        let _ = (level, cli_output);
+        use clap::ValueEnum;
+        let otlp_formats: Vec<_> = specs
+            .iter()
+            .filter(|s| s.format.is_otlp())
+            .map(|s| {
+                s.format
+                    .to_possible_value()
+                    .map(|v| v.get_name().to_string())
+                    .unwrap_or_else(|| format!("{:?}", s.format))
+            })
+            .collect();
+        eprintln!(
+            "error: trace format(s) '{}' require the corresponding cargo feature \
+             (otlp-grpc, otlp-http-protobuf, or otlp-http-json)",
+            otlp_formats.join(", ")
+        );
+        std::process::exit(1);
     }
 }

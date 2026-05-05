@@ -1,5 +1,5 @@
-use blake3;
-use devenv_core::{DevenvPaths, NixBackend, Options};
+use devenv_cache_core::compute_string_hash;
+use devenv_core::{Backend, BuildOptions, DevenvPaths, Evaluator};
 use miette::{IntoDiagnostic, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -17,8 +17,7 @@ impl ChangelogEntry {
     /// Generate a unique hash for this changelog entry based on date and title
     pub fn hash(&self) -> String {
         let content = format!("{}:{}", self.date, self.title);
-        let hash = blake3::hash(content.as_bytes());
-        hash.to_hex().to_string()
+        compute_string_hash(&content)
     }
 }
 
@@ -29,21 +28,21 @@ struct ChangelogCache {
 }
 
 pub struct Changelog<'a> {
-    nix: &'a dyn NixBackend,
+    backend: &'a Backend<dyn Evaluator>,
     dot_gc: PathBuf,
     cache_file: PathBuf,
 }
 
 impl<'a> Changelog<'a> {
-    pub fn new(nix: &'a dyn NixBackend, paths: &DevenvPaths) -> Self {
+    pub fn new(backend: &'a Backend<dyn Evaluator>, paths: &DevenvPaths) -> Self {
         Self {
-            nix,
+            backend,
             dot_gc: paths.dot_gc.clone(),
             cache_file: paths.dotfile.join("changelog-cache.json"),
         }
     }
 
-    pub async fn show_new(&self) -> Result<()> {
+    pub async fn show_new(&self) -> Result<Option<String>> {
         // Load all current changelogs
         let all_changelogs = match self.load_changelogs().await {
             Ok(changelogs) => changelogs,
@@ -52,7 +51,7 @@ impl<'a> Changelog<'a> {
                 tracing::warn!(
                     "Changelog not available. Update devenv modules for changelog support."
                 );
-                return Ok(());
+                return Ok(None);
             }
         };
 
@@ -62,57 +61,57 @@ impl<'a> Changelog<'a> {
         // Filter to unseen entries
         let new_changelogs = self.filter_unseen_changelogs(all_changelogs, &cache);
 
-        if !new_changelogs.is_empty() {
-            // Display new changelogs
-            self.display_changelogs(&new_changelogs)?;
-
-            // Update cache with newly shown hashes
-            for entry in &new_changelogs {
-                cache.shown_hashes.insert(entry.hash());
-            }
-
-            // Save updated cache
-            save_cache(&self.cache_file, &cache)?;
+        if new_changelogs.is_empty() {
+            return Ok(None);
         }
 
-        Ok(())
+        // Render changelogs to string
+        let output = Self::render_changelogs(&new_changelogs);
+
+        // Update cache with newly shown hashes
+        for entry in &new_changelogs {
+            cache.shown_hashes.insert(entry.hash());
+        }
+
+        // Save updated cache
+        save_cache(&self.cache_file, &cache)?;
+
+        Ok(Some(output))
     }
 
-    pub async fn show_all(&self) -> Result<()> {
+    pub async fn show_all(&self) -> Result<Option<String>> {
         let all_changelogs = match self.load_changelogs().await {
             Ok(changelogs) => changelogs,
             Err(_) => {
                 tracing::warn!(
                     "Changelog not available. Update devenv modules for changelog support."
                 );
-                return Ok(());
+                return Ok(None);
             }
         };
-        self.display_changelogs(&all_changelogs)?;
-        Ok(())
+        if all_changelogs.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(Self::render_changelogs(&all_changelogs)))
     }
 
     async fn load_changelogs(&self) -> Result<Vec<ChangelogEntry>> {
-        let changelog_json_file = {
-            let gc_root = self.dot_gc.join("changelog-json");
-            let options = Options {
-                bail_on_error: false,
-                ..Default::default()
-            };
-            self.nix
-                .build(
-                    &["devenv.config.changelog.json"],
-                    Some(options),
-                    Some(&gc_root),
-                )
-                .await?
-        };
+        let gc_root = self.dot_gc.join("changelog-json");
+        let outputs = self
+            .backend
+            .build_devenv(
+                &["devenv.config.changelog.json"],
+                BuildOptions {
+                    gc_root: Some(gc_root),
+                },
+            )
+            .await?;
 
-        let changelog_path = changelog_json_file
+        let changelog_path = outputs
             .first()
             .ok_or_else(|| miette::miette!("No changelog output produced by build"))?;
 
-        let changelog_json = tokio::fs::read_to_string(changelog_path)
+        let changelog_json = tokio::fs::read_to_string(changelog_path.as_path())
             .await
             .into_diagnostic()?;
 
@@ -138,35 +137,33 @@ impl<'a> Changelog<'a> {
         unseen
     }
 
-    /// Display changelogs with markdown rendering
-    fn display_changelogs(&self, changelogs: &[ChangelogEntry]) -> Result<()> {
-        if changelogs.is_empty() {
-            return Ok(());
-        }
+    /// Render changelogs with markdown rendering to a string
+    fn render_changelogs(changelogs: &[ChangelogEntry]) -> String {
+        use std::fmt::Write;
 
-        println!("\n📋 changelog\n");
-
+        let mut output = String::new();
         let skin = MadSkin::default();
+
+        writeln!(output, "\n📋 changelog\n").unwrap();
 
         for entry in changelogs {
             // Format: date: **title**
             let header = format!("{}: **{}**", entry.date, entry.title);
-            println!("{}", skin.inline(&header));
-            println!();
+            writeln!(output, "{}", skin.inline(&header)).unwrap();
+            writeln!(output).unwrap();
 
             // Render markdown description with indentation
-            let lines = entry.description.lines();
-            for line in lines {
+            for line in entry.description.lines() {
                 if line.trim().is_empty() {
-                    println!();
+                    writeln!(output).unwrap();
                 } else {
-                    println!("  {}", skin.inline(line));
+                    writeln!(output, "  {}", skin.inline(line)).unwrap();
                 }
             }
-            println!();
+            writeln!(output).unwrap();
         }
 
-        Ok(())
+        output
     }
 }
 

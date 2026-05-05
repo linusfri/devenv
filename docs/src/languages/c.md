@@ -19,12 +19,18 @@ boolean
 
 
 *Default:*
-` false `
+
+```nix
+false
+```
 
 
 
 *Example:*
-` true `
+
+```nix
+true
+```
 
 *Declared by:*
  - [https://github\.com/cachix/devenv/blob/main/src/modules/languages/c\.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/c.nix)
@@ -34,7 +40,7 @@ boolean
 ### languages\.c\.debugger
 
 An optional debugger package to use with c\.
-The default is ` gdb `, if supported on the current system\.
+The default is ` lldb ` on macOS, ` gdb ` on Linux (if supported), or ` null ` otherwise\.
 
 
 
@@ -44,7 +50,10 @@ null or package
 
 
 *Default:*
-` pkgs.gdb `
+
+```nix
+pkgs.gdb
+```
 
 *Declared by:*
  - [https://github\.com/cachix/devenv/blob/main/src/modules/languages/c\.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/c.nix)
@@ -65,12 +74,18 @@ boolean
 
 
 *Default:*
-` true `
+
+```nix
+true
+```
 
 
 
 *Example:*
-` true `
+
+```nix
+true
+```
 
 *Declared by:*
  - [https://github\.com/cachix/devenv/blob/main/src/modules/languages/c\.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/c.nix)
@@ -91,7 +106,10 @@ package
 
 
 *Default:*
-` pkgs.ccls `
+
+```nix
+pkgs.ccls
+```
 
 *Declared by:*
  - [https://github\.com/cachix/devenv/blob/main/src/modules/languages/c\.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/c.nix)

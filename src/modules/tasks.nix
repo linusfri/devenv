@@ -14,6 +14,17 @@ let
     let
       lock = builtins.fromJSON (builtins.readFile ./../../flake.lock);
       lockedNixpkgs = lock.nodes.nixpkgs.locked;
+      lockedRustOverlay = lock.nodes.rust-overlay.locked or null;
+      # Fetch rust-overlay if it's in the lock file
+      rustOverlaySource =
+        if lockedRustOverlay != null && lockedRustOverlay.type == "github" then
+          pkgs.fetchFromGitHub
+            {
+              inherit (lockedRustOverlay) owner repo rev;
+              hash = lockedRustOverlay.narHash;
+            }
+        else
+          null;
       devenvPkgs =
         if lockedNixpkgs.type == "github" then
           let
@@ -21,13 +32,25 @@ let
               inherit (lockedNixpkgs) owner repo rev;
               hash = lock.nodes.nixpkgs.locked.narHash;
             };
+            # rust-overlay default.nix returns an overlay function when imported
+            rustOverlay = if rustOverlaySource != null then import rustOverlaySource else null;
+            overlays = lib.optional (rustOverlay != null) rustOverlay;
           in
-          import source { system = pkgs.stdenv.system; }
+          import source { inherit overlays; system = pkgs.stdenv.system; }
         else
           pkgs;
-      workspace = devenvPkgs.callPackage ./../../workspace.nix { };
+      # Use rust-overlay's stable Rust for buildRustCrate
+      rustToolchain =
+        if devenvPkgs ? rust-bin
+        then devenvPkgs.rust-bin.stable.latest.default
+        else devenvPkgs.rustc;
+      workspace = devenvPkgs.callPackage ./../../nix/workspace.nix {
+        pkgs = devenvPkgs;
+        rustc = rustToolchain;
+        cargo = rustToolchain;
+      };
     in
-    workspace.crates.devenv-tasks-fast-build;
+    workspace.crates.devenv-tasks;
 
   taskType = types.submodule
     ({ name, config, ... }:
@@ -45,24 +68,35 @@ let
                 if config.binary != null
                 then config.binary == "bash"
                 else config.package.meta.mainProgram or null == "bash";
-              # Output exports in a format the Rust executor can parse
-              # Format: DEVENV_EXPORT:<base64-encoded-var>=<base64-encoded-value>
-              # Base64 encoding handles special characters safely
-              exportVars = vars: ''
+              # Export env vars from tasks.
+              # CLI 2.0.4+: write name\0base64(value)\0 pairs to $DEVENV_TASK_EXPORTS_FILE
+              # Older: echo DEVENV_EXPORT:<base64-key>=<base64-value> to stdout
+              useFileExports = inputs.config.devenv.cli.version != null
+                && lib.versionAtLeast inputs.config.devenv.cli.version "2.0.4";
+              varLoop = body: vars: ''
                 for _var in ${lib.concatStringsSep " " vars}; do
                   if [ -n "''${!_var+x}" ]; then
-                    _var_b64=$(printf '%s' "$_var" | base64 -w0)
-                    _val_b64=$(printf '%s' "''${!_var}" | base64 -w0)
-                    echo "DEVENV_EXPORT:$_var_b64=$_val_b64"
+                    ${body}
                   fi
                 done
               '';
+              exportVars =
+                if useFileExports then
+                  varLoop ''
+                    _val_b64=$(printf '%s' "''${!_var}" | base64 -w0)
+                    printf '%s\0%s\0' "$_var" "$_val_b64" >> "$DEVENV_TASK_EXPORTS_FILE"
+                  '' else
+                  varLoop ''
+                    _var_b64=$(printf '%s' "$_var" | base64 -w0)
+                    _val_b64=$(printf '%s' "''${!_var}" | base64 -w0)
+                    echo "DEVENV_EXPORT:$_var_b64=$_val_b64"
+                  '';
             in
             pkgs.writeScript name ''
               #!${binary}
               ${lib.optionalString (!isStatus && isBash) "set -e"}
               ${command}
-              ${lib.optionalString (config.exports != [] && !isStatus) (exportVars config.exports)}
+              ${lib.optionalString (config.exports != []) (exportVars config.exports)}
             '';
       in
       {
@@ -130,14 +164,7 @@ let
               env = config.env;
               cwd = config.cwd;
               show_output = config.showOutput;
-              process = {
-                ready = config.ready;
-                restart = config.restart;
-                listen = config.listen;
-                ports = config.ports;
-                watch = config.watch;
-                watchdog = config.watchdog;
-              };
+              inherit (config) process;
             };
             description = "Internal configuration for the task.";
           };
@@ -169,10 +196,12 @@ let
               Here's a helpful mnemonic to remember: This task runs *after* these tasks.
 
               You can append a suffix to control dependency behavior:
-              - `task` or `task@ready` - wait for task to succeed (default, fails if dependency fails)
-              - `task@complete` - wait for task to finish (soft dependency, does NOT propagate failure)
+              - `task@started` - wait for task to begin execution
+              - `task` or `task@ready` - wait for task to be ready/healthy (default for processes, processes only)
+              - `task@succeeded` - wait for task to exit successfully (default for tasks, tasks only)
+              - `task@completed` - wait for task to finish, regardless of exit code (soft dependency)
 
-              Example: `after = [ "pnpm:install@complete" ];` allows this task to run
+              Example: `after = [ "pnpm:install@completed" ];` allows this task to run
               even if pnpm:install fails.
             '';
             default = [ ];
@@ -185,8 +214,10 @@ let
               Here's a helpful mnemonic to remember: This task runs *before* these tasks.
 
               You can append a suffix to control dependency behavior:
-              - `task` or `task@ready` - the dependent waits for this task to succeed (default)
-              - `task@complete` - the dependent waits for this task to finish (soft dependency)
+              - `task@started` - the dependent waits for this task to begin execution
+              - `task` or `task@ready` - the dependent waits for this task to be ready/healthy (default for processes, processes only)
+              - `task@succeeded` - the dependent waits for this task to exit successfully (default for tasks, tasks only)
+              - `task@completed` - the dependent waits for this task to finish (soft dependency)
             '';
             default = [ ];
           };
@@ -201,142 +232,143 @@ let
             description = "Working directory to run the task in. If not specified, the current working directory will be used.";
           };
 
-          ready = lib.mkOption {
-            type = types.nullOr readyType;
-            default = null;
-            description = "How to determine if this process task is ready to serve.";
-          };
-
-          # Process-specific configuration (only used when type = "process")
-          restart = lib.mkOption {
+          process = lib.mkOption {
             type = types.submodule {
               options = {
-                on = lib.mkOption {
-                  type = types.enum [ "never" "always" "on_failure" ];
-                  default = "on_failure";
-                  description = "When to restart: never, always, or on_failure.";
+                start = lib.mkOption {
+                  type = types.submodule {
+                    options = {
+                      enable = lib.mkOption {
+                        type = types.bool;
+                        default = true;
+                        description = "Whether to start this process automatically.";
+                      };
+                    };
+                  };
+                  default = { };
+                  description = "Auto-start configuration for this process.";
                 };
-                max = lib.mkOption {
-                  type = types.nullOr types.int;
-                  default = 5;
-                  description = "Maximum restart attempts. null = unlimited.";
-                };
-                window = lib.mkOption {
-                  type = types.nullOr types.ints.unsigned;
+
+                ready = lib.mkOption {
+                  type = types.nullOr readyType;
                   default = null;
-                  description = "Sliding window in seconds for restart rate limiting. null = lifetime limit.";
+                  description = "How to determine if this process task is ready to serve.";
+                };
+
+                restart = lib.mkOption {
+                  type = types.submodule {
+                    options = {
+                      on = lib.mkOption {
+                        type = types.enum [ "never" "always" "on_failure" ];
+                        default = "on_failure";
+                        description = "When to restart: never, always, or on_failure.";
+                      };
+                      max = lib.mkOption {
+                        type = types.nullOr types.int;
+                        default = 5;
+                        description = "Maximum restart attempts. null = unlimited.";
+                      };
+                      window = lib.mkOption {
+                        type = types.nullOr types.ints.unsigned;
+                        default = null;
+                        description = "Sliding window in seconds for restart rate limiting. null = lifetime limit.";
+                      };
+                    };
+                  };
+                  default = { };
+                  description = "Process restart policy.";
+                };
+
+                ports = lib.mkOption {
+                  type = types.attrsOf types.port;
+                  default = { };
+                  description = ''
+                    Allocated ports for this process (name -> port number).
+                    Populated automatically from process port allocation.
+                  '';
+                };
+
+                listen = lib.mkOption {
+                  type = types.listOf listenType;
+                  default = [ ];
+                  description = "Socket activation configuration for systemd-style socket passing.";
+                  example = [
+                    {
+                      name = "http";
+                      kind = "tcp";
+                      address = "127.0.0.1:8080";
+                    }
+                    {
+                      name = "admin";
+                      kind = "unix_stream";
+                      path = "$DEVENV_STATE/admin.sock";
+                      mode = 384; # 0o600
+                    }
+                  ];
+                };
+
+                watchdog = lib.mkOption {
+                  type = types.nullOr (types.submodule {
+                    options = {
+                      usec = lib.mkOption {
+                        type = types.int;
+                        description = "Watchdog interval in microseconds";
+                      };
+
+                      require_ready = lib.mkOption {
+                        type = types.bool;
+                        default = true;
+                        description = "Require READY=1 notification before enforcing watchdog";
+                      };
+                    };
+                  });
+                  default = null;
+                  description = "Systemd watchdog configuration.";
+                  example = lib.literalExpression ''
+                    {
+                      usec = 30000000; # 30 seconds
+                      require_ready = true;
+                    }
+                  '';
+                };
+
+                watch = lib.mkOption {
+                  type = types.submodule {
+                    options = {
+                      paths = lib.mkOption {
+                        type = types.listOf types.str;
+                        default = [ ];
+                        description = ''
+                          Paths to watch for changes (files or directories).
+                          When files in these paths change, the process will be restarted.
+                        '';
+                      };
+
+                      extensions = lib.mkOption {
+                        type = types.listOf types.str;
+                        default = [ ];
+                        description = ''
+                          File extensions to watch (e.g., "rs", "js", "py").
+                          If empty, all file extensions are watched.
+                        '';
+                      };
+
+                      ignore = lib.mkOption {
+                        type = types.listOf types.str;
+                        default = [ ];
+                        description = ''
+                          Glob patterns to ignore (e.g., ".git", "target", "*.log").
+                        '';
+                      };
+                    };
+                  };
+                  default = { };
+                  description = "File watching configuration for automatic process restarts.";
                 };
               };
             };
             default = { };
-            description = "Process restart policy. Only used when type = \"process\".";
-          };
-
-          ports = lib.mkOption {
-            type = types.attrsOf types.port;
-            default = { };
-            description = ''
-              Allocated ports for this process (name -> port number).
-              Populated automatically from process port allocation.
-
-              Only used when type = "process".
-            '';
-          };
-
-          listen = lib.mkOption {
-            type = types.listOf listenType;
-            default = [ ];
-            description = ''
-              Socket activation configuration for systemd-style socket passing.
-
-              Only used when type = "process".
-            '';
-            example = [
-              {
-                name = "http";
-                kind = "tcp";
-                address = "127.0.0.1:8080";
-              }
-              {
-                name = "admin";
-                kind = "unix_stream";
-                path = "$DEVENV_STATE/admin.sock";
-                mode = 384; # 0o600
-              }
-            ];
-          };
-
-          watchdog = lib.mkOption {
-            type = types.nullOr (types.submodule {
-              options = {
-                usec = lib.mkOption {
-                  type = types.int;
-                  description = "Watchdog interval in microseconds";
-                };
-
-                require_ready = lib.mkOption {
-                  type = types.bool;
-                  default = true;
-                  description = "Require READY=1 notification before enforcing watchdog";
-                };
-              };
-            });
-            default = null;
-            description = ''
-              Systemd watchdog configuration.
-
-              Only used when type = "process".
-            '';
-            example = lib.literalExpression ''
-              {
-                usec = 30000000; # 30 seconds
-                require_ready = true;
-              }
-            '';
-          };
-
-          watch = lib.mkOption {
-            type = types.submodule {
-              options = {
-                paths = lib.mkOption {
-                  type = types.listOf types.path;
-                  default = [ ];
-                  description = ''
-                    Paths to watch for changes (files or directories).
-                    When files in these paths change, the process will be restarted.
-
-                    Only used when type = "process".
-                  '';
-                };
-
-                extensions = lib.mkOption {
-                  type = types.listOf types.str;
-                  default = [ ];
-                  description = ''
-                    File extensions to watch (e.g., "rs", "js", "py").
-                    If empty, all file extensions are watched.
-
-                    Only used when type = "process".
-                  '';
-                };
-
-                ignore = lib.mkOption {
-                  type = types.listOf types.str;
-                  default = [ ];
-                  description = ''
-                    Glob patterns to ignore (e.g., ".git", "target", "*.log").
-
-                    Only used when type = "process".
-                  '';
-                };
-              };
-            };
-            default = { };
-            description = ''
-              File watching configuration for automatic process restarts.
-
-              Only used when type = "process".
-            '';
+            description = "Process-specific configuration. Only used when type = \"process\".";
           };
 
         };
@@ -380,7 +412,15 @@ in
       }
     ];
 
-    env.DEVENV_TASKS = builtins.toJSON tasksJSON;
+    # Skip DEVENV_TASKS env var for the native process manager on CLI 2.0+,
+    # where DEVENV_TASK_FILE is sufficient and avoids bloating the environment.
+    env.DEVENV_TASKS =
+      let
+        isNativeWith2Plus = config.process.manager.implementation == "native"
+          && config.devenv.cli.version != null
+          && lib.versionAtLeast config.devenv.cli.version "2.0";
+      in
+      lib.optionalString (!isNativeWith2Plus) (builtins.toJSON tasksJSON);
     env.DEVENV_TASK_FILE = config.task.config;
     task.config = (pkgs.formats.json { }).generate "tasks.json" tasksJSON;
 
